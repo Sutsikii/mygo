@@ -1325,11 +1325,13 @@ func TestSchemeCORS(t *testing.T) {
 	if err := w.Page().LoadURL("app://localhost/"); err != nil {
 		t.Fatal(err)
 	}
-	waitFor(t, w, `document.readyState === "complete"`)
-	data := "assets://localhost/data"
-	if runtime.GOOS == "windows" {
-		data = "http://assets.localhost/data" // how WebView2 serves custom schemes
+	origin, data := "app://localhost", "assets://localhost/data"
+	if runtime.GOOS == "windows" { // how WebView2 serves custom schemes
+		origin, data = "http://app.localhost", "http://assets.localhost/data"
 	}
+	// The origin too: right after LoadURL, the previous document may still
+	// be the one that is complete, and its requests end with it.
+	waitFor(t, w, `location.origin === "`+origin+`" && document.readyState === "complete"`)
 	get := `const r = await fetch("` + data + `"); return (await r.text()) + "|" + r.headers.get("X-Count")`
 	if got, err := mygo.EvalAs[string](w.Page(), get); err != nil || got != "asset data|3" {
 		t.Errorf("GET from the app: %q, %v", got, err)
