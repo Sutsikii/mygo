@@ -151,11 +151,15 @@ func (w *window) installMenu(m *platform.Menu) {
 }
 
 // menuShown reports whether the menu bar is on the window. One that hides
-// is there only while the keyboard is in it, and a window without a caption
-// has no room for it.
+// is there only while the keyboard is in it, and a window without a caption,
+// or in full screen, has no room for it.
 func (w *window) menuShown() bool {
-	return w.hmenu != 0 && !w.captionless() && (!w.autoHideMenu || w.revealed)
+	return w.hmenu != 0 && !w.barless() && (!w.autoHideMenu || w.revealed)
 }
+
+// barless reports a window that has no room for a menu bar: Alt and F10
+// open its menus in a popup instead.
+func (w *window) barless() bool { return w.captionless() || w.fullScreen }
 
 // attachMenu puts the menu bar on the window, or takes it off one whose bar
 // hides. Its shortcuts work either way: they come from the webview.
@@ -181,10 +185,10 @@ func (w *window) revealMenu(wp, lp uintptr) uintptr {
 }
 
 // popupMenuBar opens the menus of the menu bar from the top-left corner of
-// a window without a caption, below its title bar, when Alt or F10 would
-// take the keyboard to the bar. The popup holds the bar's own submenus, so
-// their items keep their states and commands, and gives them back before
-// it is destroyed.
+// a window without room for the bar, below its title bar, when Alt or F10
+// would take the keyboard to the bar. The popup holds the bar's own
+// submenus, so their items keep their states and commands, and gives them
+// back before it is destroyed.
 func (w *window) popupMenuBar() {
 	n, _, _ := procGetMenuItemCount.Call(w.hmenu)
 	count := int(int32(n))

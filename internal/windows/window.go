@@ -353,7 +353,7 @@ func (w *window) message(m uint32, wp, lp uintptr) (uintptr, bool) {
 		// Alt or F10 alone (lp 0) take the keyboard to the menu bar. WebView2
 		// passes no Alt+letter on, so mnemonics never reach the window.
 		if wp&0xFFF0 == scKeyMenu && lp == 0 && w.hmenu != 0 {
-			if w.captionless() {
+			if w.barless() {
 				w.popupMenuBar()
 				return 0, true
 			}
@@ -687,6 +687,7 @@ func (w *window) SetFullScreen(v bool) {
 		w.fullScreen = true
 		style := w.saved.style &^ (wsCaption | wsThickFrame)
 		setWindowLong(w.hwnd, gwlStyle, style)
+		w.attachMenu() // no menu bar in full screen
 		m := monitorInfo(w.monitor()).Monitor
 		procSetWindowPos.Call(w.hwnd, 0, uintptr(m.Left), uintptr(m.Top), uintptr(m.Right-m.Left), uintptr(m.Bottom-m.Top), swpNoZOrder|swpFrameChanged)
 		w.h.EnteredFullScreen()
@@ -696,6 +697,7 @@ func (w *window) SetFullScreen(v bool) {
 	w.fullScreen = false
 	setWindowLong(w.hwnd, gwlStyle, w.saved.style)
 	setWindowLong(w.hwnd, gwlExStyle, w.saved.exStyle)
+	w.attachMenu()
 	procSetWindowPlacement.Call(w.hwnd, uintptr(unsafe.Pointer(&w.saved.placement)))
 	procSetWindowPos.Call(w.hwnd, 0, 0, 0, 0, 0, swpNoMove|swpNoSize|swpNoZOrder|swpFrameChanged)
 	w.h.LeftFullScreen()

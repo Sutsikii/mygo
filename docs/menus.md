@@ -109,7 +109,8 @@ mygo.NewWindow(mygo.WindowOptions{URL: "/", AutoHideMenuBar: true})
 A Windows window without a title bar, frameless or with a hidden title
 bar, has no room for a menu bar either: Alt and F10 open its menus in a
 popup from the top-left corner, below the title bar the page draws. On
-Linux the bar shows above the page.
+Linux the bar shows above the page. A Windows window in full screen hides
+its menu bar the same way, and gets it back when it leaves full screen.
 
 ## Context menus
 

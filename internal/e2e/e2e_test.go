@@ -710,6 +710,36 @@ func TestEmptyWindowMenu(t *testing.T) {
 	}
 }
 
+// A window in full screen has no menu bar, so the page fills the screen,
+// and gets the bar back when it leaves full screen.
+func TestFullScreenMenuBar(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("no window manager under Xvfb; the macOS menu bar belongs to the application")
+	}
+	w := newWindow(t, mygo.WindowOptions{Width: 400, Height: 300})
+	prev := mygo.App.Menu()
+	defer mygo.App.SetMenu(prev)
+	mygo.App.SetMenu(mygo.NewMenu([]*mygo.MenuItem{{Label: "App", Submenu: []*mygo.MenuItem{{Label: "Item"}}}}))
+	if shown, _ := menuBarShown(w); !shown {
+		t.Fatal("the window has no menu bar of the application")
+	}
+	w.SetFullScreen(true)
+	eventually(t, "the window in full screen", w.IsFullScreen)
+	if shown, _ := menuBarShown(w); shown {
+		t.Error("the menu bar shows in full screen")
+	}
+	eventually(t, "the page to fill the window in full screen", func() bool {
+		_, h := w.Size()
+		_, ch := w.ContentSize()
+		return ch == h
+	})
+	w.SetFullScreen(false)
+	eventually(t, "the window out of full screen", func() bool { return !w.IsFullScreen() })
+	if shown, _ := menuBarShown(w); !shown {
+		t.Error("the menu bar did not come back after full screen")
+	}
+}
+
 // Resizing a centered window keeps its position, also when it was
 // resized right before, which GTK has not confirmed yet.
 func TestCenterThenResize(t *testing.T) {
