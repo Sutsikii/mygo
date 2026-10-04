@@ -95,3 +95,5 @@ func glSurface(*mygo.Window) (string, []byte, int, int, bool) { return "", nil, 
 func rightClick(*mygo.Window, float64, float64) bool { return false }
 func popupMenus() ([][]string, bool)                 { return nil, false }
 func choosePopupItem(string) bool                    { return false }
+
+func webViewAt(*mygo.Window, float64, float64) (bool, bool) { return false, false }

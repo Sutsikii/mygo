@@ -58,10 +58,11 @@ type, as `counter` declares `n`; [Views](views.md) says more.
 (`go run ./examples/counter-native`), and `go run ./examples/gallery`
 tours what the toolkit does.
 
-One app can have windows of both kinds. Native UI suits tools, settings,
-inspectors and utilities, and apps that must start instantly; a web page
-suits rich documents, existing web code and anything that needs what only
-a browser has. Screen readers and other assistive technology read native
+One app can have windows of both kinds, and native UI can show web pages
+in its own windows (see [Web view](web-view.md)). Native UI suits tools,
+settings, inspectors and utilities, and apps that must start instantly; a
+web page suits rich documents, existing web code and anything that needs
+what only a browser has. Screen readers and other assistive technology read native
 UI as they read other apps (see [Accessibility](accessibility.md)).
 
 ## Guides
@@ -165,6 +166,8 @@ UI as they read other apps (see [Accessibility](accessibility.md)).
 - [Accordion](accordion.md): sections that open and close, one above the
   other.
 - [Form](form.md): labeled controls with descriptions and errors.
+- [Web view](web-view.md): a web page inside native UI, beside native
+  controls or a page per tab.
 
 ## Navigation
 

@@ -32,6 +32,8 @@ type host interface {
 	// popupMenu shows a context menu at (x, y) after the event being
 	// handled; chosen receives the ID of the item chosen.
 	popupMenu(m *platform.Menu, x, y float32, chosen func(id int))
+	// placeView shows a native view at r, or hides it.
+	placeView(v NativeView, r Rect, visible bool)
 }
 
 // engine runs the user interface of one window: it builds frames with
@@ -118,6 +120,10 @@ type engine struct {
 	// announcements are the texts for assistive technology to read out
 	// (Context.Announce).
 	announcements []string
+	// views are the native views the frame being committed shows, and
+	// shown those shown, where.
+	views []placedView
+	shown map[NativeView]Rect
 	// dropOver is the element files are dragged over; access is true once
 	// assistive technology asked for the content.
 	dropOver   uint64
@@ -250,6 +256,7 @@ func (rt *engine) runFrame() {
 	root := rt.c.root
 	layoutTree(root, w, h)
 	rt.commit(root)
+	rt.placeViews()
 	rt.paint(root, w, h, scale)
 	for try := 0; try < 2 && rt.text.Full(); try++ {
 		// The glyph atlas filled up and left some out: make room, keeping
@@ -480,6 +487,9 @@ func (rt *engine) commitElement(e *Element, clip Rect, hidden bool) {
 			// Their paragraph shows the text of the others.
 			rt.labels = append(rt.labels, labelNode{e.id, label, intersect(e.frags[0], clip)})
 		}
+	}
+	if e.view != nil && !invisible {
+		rt.noteView(e, v)
 	}
 	if e.flags&flagFocusable != 0 && !e.IsDisabled() && !invisible {
 		rt.focusOrder = append(rt.focusOrder, e.id)

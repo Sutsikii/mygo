@@ -277,6 +277,13 @@ type Window struct {
 	OnEval func(js string)
 
 	surface *Surface
+	// host is the window whose surface shows the web view, for a web view
+	// (Surface.NewWebView); Frame and Shown are where it last showed.
+	host  *Window
+	Frame platform.RectF
+	Shown bool
+	// Focused counts the calls to Focus.
+	Focused int
 }
 
 // Surface returns the window's surface, nil unless it was created with
@@ -382,7 +389,7 @@ func (w *Window) Show()                              { w.mu.Lock(); w.visible, w
 func (w *Window) ShowInactive()                      { w.mu.Lock(); w.visible = true; w.mu.Unlock() }
 func (w *Window) Hide()                              { w.mu.Lock(); w.visible = false; w.mu.Unlock() }
 func (w *Window) IsVisible() bool                    { w.mu.Lock(); defer w.mu.Unlock(); return w.visible }
-func (w *Window) Focus()                             { w.H.Focused() }
+func (w *Window) Focus()                             { w.focus() }
 func (w *Window) Blur()                              { w.H.Blurred() }
 func (w *Window) IsFocused() bool                    { w.mu.Lock(); defer w.mu.Unlock(); return w.focused }
 func (w *Window) Minimize()                          { w.mu.Lock(); w.minimized = true; w.mu.Unlock(); w.H.Minimized() }
@@ -459,7 +466,40 @@ func (w *Window) Close() {
 	}
 	w.closed = true
 	w.mu.Unlock()
+	if w.host != nil {
+		return // a web view tells its handler nothing
+	}
+	for _, v := range w.WebViews() {
+		v.Close()
+	}
 	w.H.Closed()
+}
+
+// WebViews returns the web views created over the window's surface.
+func (w *Window) WebViews() []*Window {
+	if w.surface == nil {
+		return nil
+	}
+	w.surface.mu.Lock()
+	defer w.surface.mu.Unlock()
+	return append([]*Window(nil), w.surface.webViews...)
+}
+
+func (w *Window) focus() {
+	if w.host != nil {
+		w.mu.Lock()
+		w.Focused++
+		w.mu.Unlock()
+		return
+	}
+	w.H.Focused()
+}
+
+// SetFrame records where the web view shows.
+func (w *Window) SetFrame(r platform.RectF, visible bool) {
+	w.mu.Lock()
+	w.Frame, w.Shown = r, visible
+	w.mu.Unlock()
 }
 
 // UserClose simulates a click on the close button.
@@ -662,6 +702,15 @@ type Surface struct {
 	textInput platform.TextInputState
 	access    *platform.AccessTree
 	accessN   int
+	webViews  []*Window
+}
+
+func (s *Surface) NewWebView(o *platform.WindowOptions, h platform.WindowHandler) (platform.WebView, error) {
+	v := &Window{b: s.w.b, H: h, Opts: o, zoom: o.Zoom, host: s.w}
+	s.mu.Lock()
+	s.webViews = append(s.webViews, v)
+	s.mu.Unlock()
+	return v, nil
 }
 
 func (s *Surface) Native() platform.SurfaceNative { return platform.SurfaceNative{} }

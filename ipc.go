@@ -391,11 +391,23 @@ func encodeReply(id int64, token string, result any, err error) message {
 type callerKey struct{}
 
 // CallerWindow returns the window whose page called a bound method, given
-// the context.Context passed to that method. It returns nil for other
-// contexts.
+// the context.Context passed to that method: for the page of a web view
+// (WebView), the window it shows in. It returns nil for other contexts.
 func CallerWindow(ctx context.Context) *Window {
 	w, _ := ctx.Value(callerKey{}).(*Window)
 	return w
+}
+
+// pageKey holds the calling page in the context of a call.
+type pageKey struct{}
+
+// CallerPage returns the page that made the call from the context passed to
+// a bound method: the page of the calling window, or of a web view in it
+// (WebView), whose window CallerWindow returns. It returns nil outside of
+// calls.
+func CallerPage(ctx context.Context) *Page {
+	p, _ := ctx.Value(pageKey{}).(*Page)
+	return p
 }
 
 // Event is a typed event the Go side sends to pages. Declare events at
@@ -449,13 +461,27 @@ func (e *Event[T]) Emit(w *Window, payload T) error {
 	return nil
 }
 
-// Broadcast sends the event to every window.
+// EmitPage sends the event to a page: the page of a web view
+// (WebView.Page), or of a window.
+func (e *Event[T]) EmitPage(p *Page, payload T) error {
+	msg, err := encodeEvent(e.name, payload)
+	if err != nil {
+		return err
+	}
+	if p == nil || p.w.IsDestroyed() {
+		return errDestroyed
+	}
+	p.w.enqueue(msg, true)
+	return nil
+}
+
+// Broadcast sends the event to every window, and the web views in them.
 func (e *Event[T]) Broadcast(payload T) error {
 	msg, err := encodeEvent(e.name, payload)
 	if err != nil {
 		return err
 	}
-	for _, w := range Windows() {
+	for _, w := range pageWindows() {
 		w.enqueue(msg, true)
 	}
 	return nil

@@ -34,6 +34,8 @@ type headless struct {
 	menu   *platform.Menu
 	menuAt [2]float32
 	chosen func(id int)
+	// views are the native views shown, where.
+	views map[NativeView]Rect
 }
 
 func (h *headless) size() (float32, float32, float32) { return h.w, h.h, h.scale }
@@ -53,6 +55,16 @@ func (h *headless) preferences() platform.Preferences          { return h.prefs 
 func (h *headless) titleBar() TitleBar                         { return h.bar }
 func (h *headless) invalidate()                                { h.requested.Store(true) }
 func (h *headless) openURL(u string)                           { h.opened = append(h.opened, u) }
+func (h *headless) placeView(v NativeView, r Rect, visible bool) {
+	if !visible {
+		delete(h.views, v)
+		return
+	}
+	if h.views == nil {
+		h.views = map[NativeView]Rect{}
+	}
+	h.views[v] = r
+}
 
 // keepAccess keeps the tree for assistive technology, and its
 // announcements.

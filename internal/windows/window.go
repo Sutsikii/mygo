@@ -75,6 +75,14 @@ type window struct {
 	htmlFor      map[string]string // LoadHTML documents by the URL they load at
 	calls        map[int]func(string, error)
 	nextCall     int
+
+	// webViews are the web views over the window's surface (webviews.go).
+	// host is the window whose surface a web view is over, frame where
+	// the surface shows it, in DIPs, and shown whether it does.
+	webViews []*window
+	host     *window
+	frame    platform.RectF
+	shown    bool
 }
 
 func (b *Backend) NewWindow(o *platform.WindowOptions, h platform.WindowHandler) (platform.Window, error) {
@@ -266,6 +274,11 @@ func (w *window) message(m uint32, wp, lp uintptr) (uintptr, bool) {
 		if w.controller != 0 {
 			comCall(w.controller, ctlNotifyParentWindowPositionChanged)
 		}
+		for _, v := range w.webViews {
+			if v.controller != 0 {
+				comCall(v.controller, ctlNotifyParentWindowPositionChanged)
+			}
+		}
 		w.h.Moved()
 		return 0, true
 	case wmActivate:
@@ -356,6 +369,7 @@ func (w *window) sized(kind uintptr) {
 	w.resizeWebView()
 	if w.surface != nil {
 		w.surface.fit()
+		w.placeWebViews() // their pixels change with the DPI
 	}
 	if w.caption != nil && kind != sizeMinimized {
 		w.caption.layout()
@@ -446,6 +460,7 @@ func (w *window) cleanup() {
 	if w.caption != nil {
 		w.caption.forget()
 	}
+	w.closeWebViews()
 	if w.controller != 0 {
 		comCall(w.controller, ctlClose)
 		release(w.settings)
@@ -641,6 +656,10 @@ func (w *window) IsVisible() bool {
 }
 
 func (w *window) Focus() {
+	if w.host != nil {
+		w.withWebView(w.focusWebView)
+		return
+	}
 	if w.IsMinimized() {
 		procShowWindow.Call(w.hwnd, swRestore)
 	}
@@ -755,6 +774,10 @@ func (w *window) Center() {
 
 func (w *window) SetBackgroundColor(c platform.Color) {
 	w.bg = &c
+	if w.host != nil {
+		w.withWebView(w.applyWebViewBackground)
+		return
+	}
 	if w.bgBrush != 0 {
 		procDeleteObject.Call(w.bgBrush)
 	}
@@ -902,6 +925,10 @@ func (w *window) TitleBarDoubleClicked() {
 }
 
 func (w *window) Close() {
+	if w.host != nil {
+		w.closeWebView()
+		return
+	}
 	if !w.closed {
 		w.destroy()
 	}

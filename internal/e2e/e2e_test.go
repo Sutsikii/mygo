@@ -2385,3 +2385,116 @@ func TestContentWindowContextMenu(t *testing.T) {
 		return len(menus) == 0
 	})
 }
+
+// TestContentWindowWebView shows a web view beside native UI: its page
+// calls Go, takes the room the view gives it, and shows above what MyGo
+// draws while the view builds it.
+func TestContentWindowWebView(t *testing.T) {
+	var frames, clicks atomic.Int32
+	var show atomic.Bool
+	show.Store(true)
+	var wv *mygo.WebView
+	view := func(c *ui.Context) {
+		frames.Add(1)
+		ui.Row(c).Fill().Children(func() {
+			if ui.Box(c).Width(100).FillHeight().Background(ui.RGB(255, 0, 0)).Clicked() {
+				clicks.Add(1)
+			}
+			if show.Load() && wv != nil {
+				ui.WebView(c, wv).Grow(1)
+			}
+		})
+	}
+	w := newWindow(t, mygo.WindowOptions{Title: "Web view", Width: 400, Height: 300, Content: ui.View(view)})
+	eventually(t, "a frame", func() bool { return frames.Load() > 0 })
+	var err error
+	wv, err = w.NewWebView(mygo.WebViewOptions{URL: "app://localhost/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w.Invalidate()
+	p := wv.Page()
+	waitForPage(t, p, "window.run")
+	if p.Window() != w || wv.Window() != w {
+		t.Error("the web view's page is not in its window")
+	}
+	got, err := mygo.EvalAs[[]any](p, "run()")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "[Hello, e2e! 2.5 CallError:division by zero true 200:echo:ping]"; fmt.Sprint(got) != want {
+		t.Errorf("results = %v, want %v", got, want)
+	}
+	if id, err := mygo.EvalAs[int](p, `window.mygo.call("Greeter.WindowID")`); err != nil || id != w.ID() {
+		t.Errorf("CallerWindow of the web view's page: %d, %v", id, err)
+	}
+	if err := ticked.EmitPage(p, Tick{N: 7}); err != nil {
+		t.Fatal(err)
+	}
+	waitForPage(t, p, "results.includes('tick7')")
+
+	// The web view takes the room the view gives it.
+	size := func() string {
+		s, _ := mygo.EvalAs[string](p, "innerWidth + 'x' + innerHeight")
+		return s
+	}
+	// The view lays out the client area, which the window's borders take
+	// from its 400x300 DIPs.
+	cw, ch := w.ContentSize()
+	want := fmt.Sprintf("%dx%d", cw-100, ch)
+	eventually(t, "the web view at "+want, func() bool { return size() == want })
+	if on, ok := webViewAt(w, 250, 150); ok && !on {
+		t.Error("the web view does not show over the native UI")
+	}
+	if on, ok := webViewAt(w, 50, 150); ok && on {
+		t.Error("the web view shows over the sidebar")
+	}
+	if click(w, 50, 150) {
+		eventually(t, "a click on the sidebar", func() bool { return clicks.Load() == 1 })
+	}
+
+	// It hides while the view does not build it, and keeps its page.
+	show.Store(false)
+	w.Invalidate()
+	if _, ok := webViewAt(w, 250, 150); ok {
+		eventually(t, "the web view hidden", func() bool { on, _ := webViewAt(w, 250, 150); return !on })
+	}
+	if _, err := p.Eval("1"); err != nil {
+		t.Errorf("the hidden web view's page: %v", err)
+	}
+	show.Store(true)
+	w.Invalidate()
+	if _, ok := webViewAt(w, 250, 150); ok {
+		eventually(t, "the web view shown again", func() bool { on, _ := webViewAt(w, 250, 150); return on })
+	}
+
+	wv.Destroy()
+	if !wv.IsDestroyed() {
+		t.Error("Destroy left the web view")
+	}
+	if _, ok := webViewAt(w, 250, 150); ok {
+		eventually(t, "the web view gone", func() bool { on, _ := webViewAt(w, 250, 150); return !on })
+	}
+	other, err := w.NewWebView(mygo.WebViewOptions{URL: "app://localhost/"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForPage(t, other.Page(), "window.run")
+	w.Destroy()
+	if !other.IsDestroyed() {
+		t.Error("the web view outlived its window")
+	}
+}
+
+// waitForPage is waitFor for any page.
+func waitForPage(t *testing.T, p *mygo.Page, expr string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if ok, _ := mygo.EvalAs[bool](p, "!!("+expr+")"); ok {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", expr)
+}

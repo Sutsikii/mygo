@@ -149,7 +149,8 @@ func registerSurfaceClass() {
 func newSurface(w *window) *surface {
 	registerSurfaceClass()
 	s := &surface{w: w}
-	s.hwnd = createWindow(0, surfaceClass, "", wsChild|wsVisible|wsClipSiblings, 0, 0, 0, 0, w.hwnd)
+	// Web views are its children, which it does not paint over.
+	s.hwnd = createWindow(0, surfaceClass, "", wsChild|wsVisible|wsClipSiblings|wsClipChildren, 0, 0, 0, 0, w.hwnd)
 	if s.hwnd == 0 {
 		return nil
 	}

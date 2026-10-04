@@ -76,7 +76,8 @@ reported to the caller like an error.
 A method whose first parameter is a `context.Context` gets one that is
 canceled when the calling page navigates away or its window closes: pass it
 on to slow work. `mygo.CallerWindow(ctx)` returns the window that called,
-for example to attach a dialog to it:
+for example to attach a dialog to it, and `mygo.CallerPage(ctx)` the page,
+which tells the page of a [web view](ui/web-view.md) from its window's:
 
 ```go
 // Export asks where to save the notes and writes them there. It returns the
@@ -220,8 +221,8 @@ type ExportProgress struct {
 }
 ```
 
-`Emit` sends an event to the page of one window and `Broadcast` to every
-window:
+`Emit` sends an event to the page of one window, `EmitPage` to one page,
+as a web view's, and `Broadcast` to every window and web view:
 
 ```go
 Progress.Emit(win, ExportProgress{Done: 3, Total: 10})

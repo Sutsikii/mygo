@@ -190,7 +190,9 @@ func (w *window) setUp(controller uintptr) {
 		return comCall(controller, ctlAddAcceleratorKeyPressed, h, tok)
 	})
 
-	comCall(controller, ctlPutIsVisible, 1)
+	if w.host == nil { // a web view shows once placed
+		comCall(controller, ctlPutIsVisible, 1)
+	}
 	w.resizeWebView()
 	if w.caption != nil {
 		w.caption.layout() // above the webview's window
@@ -220,6 +222,10 @@ func (w *window) addFilter(pattern string) {
 
 func (w *window) resizeWebView() {
 	if w.controller == 0 {
+		return
+	}
+	if w.host != nil {
+		w.placeWebView()
 		return
 	}
 	var r rect
@@ -419,7 +425,7 @@ func (w *window) acceleratorKeyPressed(_, args uintptr) {
 	}
 	var vk uint32
 	comCall(args, accelGetVirtualKey, uintptr(unsafe.Pointer(&vk)))
-	cmd, ok := w.accels[accelKey{vk: vk, mods: currentModifiers()}]
+	cmd, ok := w.top().accels[accelKey{vk: vk, mods: currentModifiers()}]
 	if !ok {
 		return
 	}

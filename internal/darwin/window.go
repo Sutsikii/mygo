@@ -66,6 +66,10 @@ type window struct {
 	trafficLights *platform.Point
 	// surface shows the content MyGo draws, in place of the web view.
 	surface *surface
+	// webViews are the web views over the surface (webviews.go), and host
+	// the window whose surface a web view is over.
+	webViews []*window
+	host     *window
 }
 
 func (b *Backend) NewWindow(o *platform.WindowOptions, h platform.WindowHandler) (platform.Window, error) {
@@ -272,6 +276,7 @@ func (w *window) cleanup() {
 	}
 	w.closed = true
 	b := w.b
+	w.closeWebViews()
 	send(w.web, "removeObserver:forKeyPath:", uintptr(w.delegate), uintptr(nsString("title")))
 	send(w.ucc, "removeScriptMessageHandlerForName:", uintptr(nsString("mygo")))
 	send(w.ucc, "removeAllUserScripts")
@@ -415,6 +420,10 @@ func (w *window) Hide() {
 func (w *window) IsVisible() bool { return sendBool(w.win, "isVisible") }
 
 func (w *window) Focus() {
+	if w.host != nil {
+		send(w.win, "makeFirstResponder:", uintptr(w.web))
+		return
+	}
 	send(w.win, "makeKeyAndOrderFront:", 0)
 	send(w.b.app, "activateIgnoringOtherApps:", 1)
 }
@@ -455,7 +464,9 @@ func (w *window) Center()            { send(w.win, "center") }
 
 func (w *window) SetBackgroundColor(c platform.Color) {
 	withPool(func() {
-		send(w.win, "setBackgroundColor:", uintptr(nsColor(c)))
+		if w.host == nil { // a web view's window is its host's
+			send(w.win, "setBackgroundColor:", uintptr(nsColor(c)))
+		}
 		send(w.web, "setValue:forKey:", uintptr(nsBool(false)), uintptr(nsString("drawsBackground")))
 		if respondsTo(w.web, "setUnderPageBackgroundColor:") {
 			send(w.web, "setUnderPageBackgroundColor:", uintptr(nsColor(c)))
@@ -601,6 +612,10 @@ func (w *window) TitleBarDoubleClicked() {
 }
 
 func (w *window) Close() {
+	if w.host != nil {
+		w.closeWebView()
+		return
+	}
 	if w.closed {
 		return
 	}
@@ -960,6 +975,8 @@ func registerWindowClasses() {
 	classDef("MyGoWebView", "WKWebView", nil, []objc.MethodDef{
 		method("mouseDown:", func(self id, cmd objc.SEL, ev id) {
 			if w := theBackend.byWebView[self]; w != nil {
+				// A web view's page drags its host (StartDrag).
+				w = w.top()
 				release(w.lastMouseDown)
 				w.lastMouseDown = retain(ev)
 			}

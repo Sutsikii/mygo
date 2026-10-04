@@ -121,6 +121,8 @@ type surface struct {
 	// lastKey is a copy of the last key press, which a context menu the
 	// key opens shows for.
 	lastKey ptr
+	// overlay holds the area, under the web views over it (webviews.go).
+	overlay ptr
 }
 
 // GDK event masks of the drawing area.
@@ -136,6 +138,8 @@ func (w *window) createSurface() {
 	connect(s.im, "preedit-changed", cbIMPreedit, data)
 	connect(s.im, "preedit-end", cbIMPreeditEnd, data)
 	s.connectSystem(data)
+	s.overlay = gtkOverlayNew()
+	gtkContainerAdd(s.overlay, s.area)
 	w.surface = s
 }
 
@@ -182,7 +186,7 @@ func (s *surface) newArea(gl bool) {
 // view or the surface.
 func (w *window) contentWidget() ptr {
 	if w.surface != nil {
-		return w.surface.area
+		return w.surface.overlay
 	}
 	return w.web
 }

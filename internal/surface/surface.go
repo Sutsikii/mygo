@@ -59,3 +59,13 @@ type Conn struct {
 type Content interface {
 	AttachContent(conn *Conn)
 }
+
+// View is a native view that the content places over its surface, as a
+// web view (mygo.WebView). Package mygo implements it.
+type View interface {
+	// PlaceView shows the view at r, in DIPs relative to the surface of
+	// conn, or hides it when visible is false. The content calls it after
+	// each frame for the views the frame showed, and once with visible
+	// false for those it no longer shows. Main thread only.
+	PlaceView(conn *Conn, r platform.RectF, visible bool)
+}

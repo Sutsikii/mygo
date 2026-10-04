@@ -348,6 +348,8 @@ var (
 	gtkWidgetSetHalign                  func(w ptr, align int32)
 	gtkWidgetSetValign                  func(w ptr, align int32)
 	gtkWidgetSetSizeRequest             func(w ptr, width, height int32)
+	gtkWidgetSetMarginStart             func(w ptr, margin int32)
+	gtkWidgetSetMarginTop               func(w ptr, margin int32)
 	gtkWidgetGetPreferredWidth          func(w ptr, min, natural *int32)
 	gtkWidgetGetPreferredHeight         func(w ptr, min, natural *int32)
 	gtkWidgetGetStyleContext            func(w ptr) ptr
@@ -745,6 +747,8 @@ func load() error {
 	mustBind(t, &gtkWidgetSetHalign, "gtk_widget_set_halign")
 	mustBind(t, &gtkWidgetSetValign, "gtk_widget_set_valign")
 	mustBind(t, &gtkWidgetSetSizeRequest, "gtk_widget_set_size_request")
+	mustBind(t, &gtkWidgetSetMarginStart, "gtk_widget_set_margin_start")
+	mustBind(t, &gtkWidgetSetMarginTop, "gtk_widget_set_margin_top")
 	mustBind(t, &gtkWidgetGetPreferredWidth, "gtk_widget_get_preferred_width")
 	mustBind(t, &gtkWidgetGetPreferredHeight, "gtk_widget_get_preferred_height")
 	mustBind(t, &gtkWidgetGetStyleContext, "gtk_widget_get_style_context")

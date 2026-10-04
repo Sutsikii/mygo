@@ -169,3 +169,8 @@ func glSurface(*mygo.Window) (string, []byte, int, int, bool) { return "", nil, 
 func rightClick(*mygo.Window, float64, float64) bool { return false }
 func popupMenus() ([][]string, bool)                 { return nil, false }
 func choosePopupItem(string) bool                    { return false }
+
+func webViewAt(w *mygo.Window, x, y float64) (on, ok bool) {
+	mygo.RunOnMain(func() { on = darwin.TestWebViewAt(w.NativeHandle(), x, y) })
+	return on, true
+}

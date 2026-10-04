@@ -44,6 +44,7 @@ framework safely. Read it before changing anything under `internal/`.
 ├── window.go           Window: the native window, its options, state and events
 ├── page.go             Page: the web page a window shows, its loading, Eval and events
 ├── content.go          Content: windows showing native UI instead of a page
+├── webview.go          WebView: web pages over a window's native UI
 ├── ipc.go              Bind/BindAs, method calls, Event[T], CallerWindow
 ├── plugin.go           Plugin and Use: services bound as "plugin:<name>"
 ├── channel.go          Channel[T]: values streamed to a call's page
@@ -93,7 +94,7 @@ framework safely. Read it before changing anything under `internal/`.
 ├── ui/                 native UI: views, layout, widgets, text editing, Tester
 ├── cmd/mygo/           the CLI: init, generate, dev, build, doctor
 ├── examples/           hello, todo, frameless, native, vibrancy; counter-native
-│                       and gallery (native UI)
+│                       and gallery (native UI); hybrid (web views in native UI)
 ├── docs/               the user guides, the official plugins' pages
 │                       (plugins/), and this architecture guide
 └── website/            the website, with these docs: TanStack Start, prerendered
@@ -609,7 +610,7 @@ build` like mygo-runtime and released with the same version.
   through a channel for as long as it lasts; the page sends with `Send`
   calls numbered in order, since calls run on goroutines of their own and
   would otherwise race, and Go writes them in that order. Connections are
-  keyed by window and a random id the page chooses.
+  keyed by page (`CallerPage`) and a random id the page chooses.
 - **updater** is the update window, in the manner of Sparkle, built on
   `mygo.Updater` alone. A *session* is a check and what follows it (the
   release notes, the download, the offer to relaunch): a goroutine that
@@ -1548,6 +1549,34 @@ either.
   minute; a renderer drawing in software in place of a GPU the window had
   tries for it the same way. A window without a GPU at its first frame
   draws in memory for good.
+- **Web views** (`webview.go`, `ui/webview.go`). `Window.NewWebView`
+  makes a web view over the surface of a window showing native UI
+  (`platform.Surface.NewWebView`), hidden until the view places it. Its
+  page lives in a `Window` of its own that no list holds, whose `host` is
+  the window: everything a page does (calls, channels, events, `Eval`,
+  custom schemes, downloads, permissions) goes through it as for a
+  window's page. Its native side (`webViewNative`) takes its page methods
+  from the backend's `platform.WebView` and its window methods from the
+  window, which drag regions use. The bridge gets the window's id,
+  `CallerWindow` returns the window and `CallerPage` the page;
+  `Broadcast` reaches the web views of every window (`pageWindows`). The
+  element of `ui.WebView` holds the view (`surface.View`, which
+  `*mygo.WebView` implements); committing a frame notes those shown, with
+  part of their box in view (`noteView`), and before painting the engine
+  tells those that moved where they are and those it no longer built that
+  they hide (`placeViews`). The backends make a web view as they make a
+  window's, as a window of their own without a native window, which their
+  window code tells apart by `host`: on macOS a `MyGoWebView` in the
+  content view above the surface, with a delegate of its own and its top
+  edge kept as the window resizes (`NSViewMinYMargin`), since AppKit's
+  origin is at the bottom; on Linux a WebKitWebView over the surface's area
+  in a `GtkOverlay`, placed by its margins, its signals finding it in
+  `Backend.webViews`; on Windows a WebView2 controller whose parent is the
+  surface's window, which clips its children (`WS_CLIPCHILDREN`), placed in
+  the pixels of the window's DPI again as the window changes size. A
+  press in a web view's page is its host's, for `StartDrag`; hiding the
+  web view that has the keyboard gives it back to the surface. Backends
+  close a window's web views as it closes, before `Closed`.
 - **Tests.** `ui.Tester` runs views against a host in memory
   (`ui/headless.go`) with the CPU renderer; the fake backend's surface lets
   the core's tests drive content windows through `package mygo`.
@@ -1913,4 +1942,5 @@ which npm allows only for packages that exist: the first release uses an
 | native UI surface | layer-backed NSView, frames from `CADisplayLink` (a timer at the display's rate before macOS 14), input methods through NSTextInputClient | GtkGLArea (GtkDrawingArea without a GPU), GtkIMMulticontext | `MyGoSurface` child window, IMM32 |
 | native UI file drops | NSDraggingDestination | GTK drag destination (`text/uri-list`) | OLE `IDropTarget` |
 | native UI accessibility | `NSAccessibilityElement` subclasses | ATK objects (GObject types registered through purego), bridged to AT-SPI by GTK | UI Automation fragments (COM objects; assembly thunks for the methods taking doubles) |
+| web views in native UI | `MyGoWebView` in the content view, above the surface | WebKitWebView in a `GtkOverlay` over the surface's area | WebView2 controller, a child of the surface's window |
 | native UI rendering | Metal, into a CAMetalLayer presenting with the Core Animation transaction | OpenGL 3.3 or ES 3.0 in the GtkGLArea's render signal; on the CPU, painted with cairo, where OpenGL runs on the CPU | Direct3D 11 (WARP without a GPU), flip-model swap chain |

@@ -489,6 +489,9 @@ func (b *Backend) applyTheme() {
 	for _, w := range b.windows {
 		b.applyWindowTheme(w)
 		w.withWebView(func() { b.applyWebViewTheme(w) })
+		for _, v := range w.webViews {
+			v.withWebView(func() { b.applyWebViewTheme(v) })
+		}
 	}
 }
 

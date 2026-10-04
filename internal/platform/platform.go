@@ -253,8 +253,6 @@ type UserScript struct {
 type Window interface {
 	// Handle returns the native window (NSWindow*, GtkWindow*, HWND).
 	Handle() uintptr
-	// WebViewHandle returns the native webview object.
-	WebViewHandle() uintptr
 	// Surface returns the drawing surface of a window created with
 	// WindowOptions.Surface, nil for others.
 	Surface() Surface
@@ -331,6 +329,14 @@ type Window interface {
 	// Close destroys the window without asking WindowHandler.ShouldClose.
 	Close()
 
+	Page
+}
+
+// Page is the web page of a Window or a WebView.
+type Page interface {
+	// WebViewHandle returns the native webview object.
+	WebViewHandle() uintptr
+
 	LoadURL(url string)
 	LoadHTML(html, baseURL string)
 	LoadFile(path, readAccessDir string)
@@ -365,6 +371,26 @@ type Window interface {
 	// "drop" message); backends record the paths before the page sees it.
 	DroppedFiles() []string
 	Print()
+}
+
+// WebView is a web view over part of a window's Surface, which the
+// window's native UI places (Surface.NewWebView). Its page reports to its
+// own WindowHandler, which gets no events of the window: those go to the
+// window's.
+type WebView interface {
+	Page
+	// SetFrame shows the web view at r, in DIPs relative to the surface,
+	// above what the surface draws; visible false hides it and keeps its
+	// page.
+	SetFrame(r RectF, visible bool)
+	// Focus gives the web view the keyboard.
+	Focus()
+	// SetBackgroundColor paints the web view before its page does.
+	SetBackgroundColor(c Color)
+	// Close destroys the web view; its handler gets no more events. The
+	// backend closes the web views of a window that closes before telling
+	// WindowHandler.Closed, and Close does nothing then.
+	Close()
 }
 
 // WindowHandler receives window and webview events from the backend.

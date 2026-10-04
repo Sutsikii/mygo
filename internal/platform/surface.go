@@ -27,6 +27,11 @@ type Surface interface {
 	// elements. The content calls it after every frame once the surface
 	// sent AccessibilityOn.
 	UpdateAccessibility(tree *AccessTree)
+	// NewWebView creates a web view over the surface, hidden until
+	// SetFrame shows it. Of opts, the webview options apply (UserScripts,
+	// Schemes, DevTools, UserAgent, Zoom, BackgroundColor, Transparent);
+	// h receives the events of its page.
+	NewWebView(opts *WindowOptions, h WindowHandler) (WebView, error)
 }
 
 // TextInputState is the state of the text input that has the keyboard,

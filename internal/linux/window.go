@@ -50,6 +50,10 @@ type window struct {
 	autoHideMenu, altAlone bool
 	// surface shows the content MyGo draws, in place of the web view.
 	surface *surface
+	// webViews are the web views over the surface (webviews.go), and host
+	// the window whose surface a web view is over.
+	webViews []*window
+	host     *window
 	// controls are the title buttons over the page of a window with a
 	// hidden title bar (titlebar.go), in an overlay with the web view.
 	controls *windowControls
@@ -96,6 +100,9 @@ type window struct {
 
 func (b *Backend) window(data ptr) *window {
 	w := b.windows[int(data)]
+	if w == nil {
+		w = b.webViews[int(data)]
+	}
 	if w == nil || w.closed {
 		return nil
 	}
@@ -283,6 +290,7 @@ func (w *window) cleanup() {
 		return
 	}
 	w.closed = true
+	w.closeWebViews()
 	delete(w.b.windows, w.id)
 	delete(w.b.byWebView, w.web)
 	dropOwner(w.owner)
@@ -430,6 +438,10 @@ func (w *window) Hide()           { gtkWidgetHide(w.win) }
 func (w *window) IsVisible() bool { return gtkWidgetGetVisible(w.win) }
 
 func (w *window) Focus() {
+	if w.host != nil {
+		gtkWidgetGrabFocus(w.web)
+		return
+	}
 	w.willShow() // presenting shows a hidden window
 	gtkWindowPresent(w.win)
 }
@@ -668,6 +680,10 @@ func (w *window) TitleBarDoubleClicked() {
 }
 
 func (w *window) Close() {
+	if w.host != nil {
+		w.closeWebView()
+		return
+	}
 	if !w.closed {
 		gtkWidgetDestroy(w.win)
 	}
@@ -1059,17 +1075,20 @@ func initWindowCallbacks() {
 		if w == nil {
 			return false
 		}
-		w.altAlone = false
+		// A press in a web view's page is its host's, which it drags
+		// (StartDrag).
+		t := w.top()
+		t.altAlone = false
 		// GdkEventButton: time 20, button 52, x_root 64, y_root 72.
-		w.press.time = field[uint32](event, 20)
-		w.press.button = int32(field[uint32](event, 52))
-		w.press.rootX = field[float64](event, 64)
-		w.press.rootY = field[float64](event, 72)
-		w.press.hasPressed = true
-		if w.press.event != 0 {
-			gdkEventFree(w.press.event)
+		t.press.time = field[uint32](event, 20)
+		t.press.button = int32(field[uint32](event, 52))
+		t.press.rootX = field[float64](event, 64)
+		t.press.rootY = field[float64](event, 72)
+		t.press.hasPressed = true
+		if t.press.event != 0 {
+			gdkEventFree(t.press.event)
 		}
-		w.press.event = gdkEventCopy(event)
+		t.press.event = gdkEventCopy(event)
 		if edge := w.resizeEdge(event); edge >= 0 {
 			// GdkEventButton: type 0; GDK_BUTTON_PRESS, not a double click.
 			if field[int32](event, 0) == 4 && w.press.button == 1 {

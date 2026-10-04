@@ -21,6 +21,9 @@ func (s *testSurface) PresentPixels([]byte, int, int, int)      { s.pixels++ }
 func (s *testSurface) SetCursor(platform.Cursor)                {}
 func (s *testSurface) SetTextInput(platform.TextInputState)     {}
 func (s *testSurface) UpdateAccessibility(*platform.AccessTree) {}
+func (s *testSurface) NewWebView(*platform.WindowOptions, platform.WindowHandler) (platform.WebView, error) {
+	return nil, platform.ErrUnsupported
+}
 
 // testGPU is a GPU renderer whose device goes away when fail is set.
 type testGPU struct {

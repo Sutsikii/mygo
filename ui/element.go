@@ -270,6 +270,8 @@ type Element struct {
 	gray      bool
 	rotate    float32 // of an Icon, in degrees
 	label     string
+	// view is the native view of a WebView.
+	view NativeView
 	// widget names the widget that used the element's state as it created
 	// it, which Key would then lose.
 	widget string

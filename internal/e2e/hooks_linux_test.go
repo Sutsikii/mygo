@@ -236,3 +236,6 @@ func choosePopupItem(label string) (ok bool) {
 	mygo.RunOnMain(func() { ok = linux.TestChoosePopupItem(label) })
 	return ok
 }
+
+// WebKitGTK's web views are widgets, which no hit test of X finds.
+func webViewAt(*mygo.Window, float64, float64) (bool, bool) { return false, false }

@@ -222,3 +222,8 @@ func choosePopupItem(label string) (ok bool) {
 	mygo.RunOnMain(func() { ok = win.TestChoosePopupItem(label) })
 	return ok
 }
+
+func webViewAt(w *mygo.Window, x, y float64) (on, ok bool) {
+	mygo.RunOnMain(func() { on = win.TestWebViewAt(w.NativeHandle(), x, y) })
+	return on, true
+}

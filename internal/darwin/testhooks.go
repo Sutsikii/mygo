@@ -531,3 +531,30 @@ func TestAccessibilityPerform(handle uintptr, label, action, value string) bool 
 	}
 	return false
 }
+
+var (
+	msgHitTest      func(obj id, sel objc.SEL, p NSPoint) id
+	registerHitTest sync.Once
+)
+
+// TestWebViewAt reports whether a web view over the surface of a window
+// is the view at x, y, in points from the top-left corner of its content.
+func TestWebViewAt(handle uintptr, x, y float64) (on bool) {
+	registerHitTest.Do(func() { purego.RegisterFunc(&msgHitTest, msgSendAddr) })
+	w := theBackend.byNSWindow[id(handle)]
+	if w == nil {
+		return false
+	}
+	withPool(func() {
+		content := send(w.win, "contentView")
+		frame := msgRect(content, sel("frame"))
+		// hitTest: takes a point of the superview.
+		hit := msgHitTest(content, sel("hitTest:"), NSPoint{frame.Origin.X + x, frame.Origin.Y + frame.Size.Height - y})
+		for _, v := range w.webViews {
+			if hit != 0 && sendBool(hit, "isDescendantOf:", uintptr(v.web)) {
+				on = true
+			}
+		}
+	})
+	return on
+}

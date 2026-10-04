@@ -361,3 +361,20 @@ func popupLabels(h uintptr) []string {
 	}
 	return labels
 }
+
+var procChildWindowFromPointEx = user32.NewProc("ChildWindowFromPointEx")
+
+// TestWebViewAt reports whether a web view shows at x, y, in DIPs, in a
+// window showing native UI: whether a visible child window of its surface,
+// as WebView2's, is there.
+func TestWebViewAt(hwnd uintptr, x, y float64) bool {
+	w := theBackend.windows[hwnd]
+	if w == nil || w.surface == nil {
+		return false
+	}
+	scale := float64(w.surface.dpi()) / 96
+	pt := uintptr(uint32(int32(x*scale))) | uintptr(uint32(int32(y*scale)))<<32
+	const cwpSkipInvisible = 1
+	child, _, _ := procChildWindowFromPointEx.Call(w.surface.hwnd, pt, cwpSkipInvisible)
+	return child != 0 && child != w.surface.hwnd
+}
