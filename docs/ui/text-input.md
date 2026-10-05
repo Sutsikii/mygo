@@ -19,7 +19,8 @@ ui.TextArea(c, &app.notes).Height(160)
 
 - `Placeholder` shows a text while the input is empty.
 - `Password` hides what it holds, and keeps it from the clipboard and input
-  methods.
+  methods. Only a `TextInput` takes it: as on every platform, a text area has
+  no password mode.
 - `AutoFocus` gives it the keyboard focus as it appears, as the first field
   of a dialog.
 - `Disabled(true)` grays it out.

@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -106,8 +105,7 @@ func (a *area) sync(b *buffer, params text.Params) {
 }
 
 // paraLayout returns the layout of paragraph p, with the composition of an
-// input method in the paragraph of the caret, and a bullet for each rune
-// of a password.
+// input method in the paragraph of the caret.
 func (a *area) paraLayout(ed *editor, p int) *text.Layout {
 	b := &ed.buf
 	pr := &b.paras[p]
@@ -122,9 +120,6 @@ func (a *area) paraLayout(ed *editor, p int) *text.Layout {
 	if compose != "" {
 		at := b.byteOf(ed.caret) - pr.byte
 		t = t[:at] + compose + t[at:]
-	}
-	if ed.password {
-		t = strings.Repeat("•", utf8.RuneCountInString(t))
 	}
 	params := a.params
 	params.Text = t

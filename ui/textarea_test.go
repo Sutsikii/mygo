@@ -459,17 +459,17 @@ func TestTextAreaShowsThroughPadding(t *testing.T) {
 	}
 }
 
-// TestTextAreaPassword checks that a text area with Password shows a
-// bullet for each rune.
+// TestTextAreaPassword checks that Password leaves a text area as it is,
+// as multi-line fields have no password mode on any platform.
 func TestTextAreaPassword(t *testing.T) {
-	key := "-----BEGIN KEY-----\nsecret\n-----END KEY-----"
-	tt := NewTester(func(c *Context) { TextArea(c, &key).Password().Height(120) }, 400, 200)
+	notes := "first\nsecond"
+	tt := NewTester(func(c *Context) { TextArea(c, &notes).Password().Height(120) }, 400, 200)
 	ed := textAreaState(tt).editor
-	for i := range ed.buf.paras {
-		l := ed.buf.paras[i].layout
-		if want := strings.Repeat("•", utf8.RuneCountInString(ed.buf.text(i))); l == nil || string(l.Runes) != want {
-			t.Errorf("paragraph %d shows %q", i, string(l.Runes))
-		}
+	if ed.password {
+		t.Fatal("Password made a text area a password field")
+	}
+	if l := ed.buf.paras[1].layout; l == nil || string(l.Runes) != "second" {
+		t.Errorf("the second paragraph shows %v", l)
 	}
 }
 

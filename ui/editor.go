@@ -786,10 +786,11 @@ func (e *Element) Placeholder(s string) *Element {
 	return e
 }
 
-// Password hides what a text input holds.
+// Password hides what a text input holds. It does nothing to a text area:
+// as on every platform, only single-line fields hide their text.
 func (e *Element) Password() *Element {
-	if e.st.editor != nil {
-		e.st.editor.password = true
+	if ed := e.st.editor; ed != nil && !ed.multiline {
+		ed.password = true
 	}
 	return e
 }
