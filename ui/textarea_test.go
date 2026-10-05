@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+	"unsafe"
 
 	"github.com/egoist/mygo/internal/text"
 )
@@ -340,5 +341,150 @@ func TestTextAreaUndoAppChanges(t *testing.T) {
 	tt.Key(Cmd, KeyZ)
 	if s != "" {
 		t.Errorf("undo made %q", s)
+	}
+}
+
+// textAreaState returns the state of the only text area of tt.
+func textAreaState(tt *Tester) *state {
+	for _, st := range tt.rt.states {
+		if st.editor != nil && st.editor.area != nil {
+			return st
+		}
+	}
+	return nil
+}
+
+// TestTextAreaUndoAppLog checks that the last step of undo keeps one
+// change however often the app sets the text after it, as a log does, and
+// that undoing the step still takes the app's texts back.
+func TestTextAreaUndoAppLog(t *testing.T) {
+	s := ""
+	tt := NewTester(func(c *Context) { TextArea(c, &s).Fill() }, 400, 300)
+	tt.Press(20, 15)
+	tt.Release(20, 15)
+	tt.Type("x")
+	tt.Frame()
+	for range 100 {
+		s += "a line of the log\n"
+		tt.Frame()
+	}
+	ed := textAreaState(tt).editor
+	if n := len(ed.undo[len(ed.undo)-1].changes); n != 1 {
+		t.Errorf("the last step holds %d changes", n)
+	}
+	// Typing after the app's text is a change of its own.
+	tt.Type("y")
+	tt.Frame()
+	if c := ed.undo[len(ed.undo)-1].changes; len(c) != 2 || c[1].inserted != "y" {
+		t.Errorf("typing after the app's text made %+v", c[len(c)-1])
+	}
+	tt.Key(Cmd, KeyZ)
+	if s != "" {
+		t.Errorf("undo made %q", s)
+	}
+}
+
+// TestTextAreaSharesValue checks that an edit leaving the text as it was
+// still gives the value the text's string, which the next frames compare
+// at once.
+func TestTextAreaSharesValue(t *testing.T) {
+	s := strings.Repeat("abc\n", 100) + "x"
+	tt := NewTester(func(c *Context) { TextArea(c, &s).Fill() }, 400, 300)
+	tt.Press(20, 15)
+	tt.Release(20, 15)
+	ed := textAreaState(tt).editor
+	ed.anchor, ed.caret = ed.buf.n-1, ed.buf.n
+	tt.Type("x")
+	tt.Frame()
+	if ed.buf.s != s || unsafe.StringData(ed.buf.s) != unsafe.StringData(s) {
+		t.Error("the value does not share the text's string")
+	}
+}
+
+// TestTextAreaRevealsWrapped checks that the caret comes into view when the
+// paragraphs above it are taller than estimated, as long ones wrapping
+// after short ones.
+func TestTextAreaRevealsWrapped(t *testing.T) {
+	s := strings.Repeat("short\n", 2000) + strings.Repeat(strings.Repeat("word ", 80)+"\n", 300) + "end"
+	tt := NewTester(func(c *Context) { TextArea(c, &s).Fill() }, 400, 300)
+	st := textAreaState(tt)
+	ed, a := st.editor, st.editor.area
+	check := func(what string) {
+		t.Helper()
+		_, y, h := a.caretAt(ed, ed.caret, 0)
+		if y < a.scroll || y+float64(h) > a.scroll+float64(st.h) {
+			t.Errorf("%s: the caret is at %v, the view from %v", what, y, a.scroll)
+		}
+	}
+	check("open")
+	tt.Press(20, 15)
+	tt.Release(20, 15)
+	tt.Key(Ctrl, KeyHome)
+	check("Ctrl+Home")
+	tt.Key(Ctrl, KeyEnd)
+	check("Ctrl+End")
+}
+
+// TestTextAreaKeepsViewOnAppText checks that a text the app sets, as a log
+// growing, leaves the view where the wheel put it.
+func TestTextAreaKeepsViewOnAppText(t *testing.T) {
+	s := strings.Repeat("a line of the log\n", 2000)
+	tt := NewTester(func(c *Context) { TextArea(c, &s).Fill() }, 400, 300)
+	tt.Press(20, 15)
+	tt.Release(20, 15)
+	tt.Key(Ctrl, KeyHome)
+	st := textAreaState(tt)
+	tt.Scroll(100, 100, 0, 5000)
+	tt.Frame()
+	s += "another line\n"
+	tt.Frame()
+	if st.scrollY != 5000 {
+		t.Errorf("the view went to %v", st.scrollY)
+	}
+}
+
+// TestTextAreaShowsThroughPadding checks that the paragraph showing in the
+// padding above the view is laid out, as the text is drawn there.
+func TestTextAreaShowsThroughPadding(t *testing.T) {
+	s := strings.Repeat("line\n", 200)
+	tt := NewTester(func(c *Context) { TextArea(c, &s).Fill() }, 400, 300)
+	tt.Press(20, 15)
+	tt.Release(20, 15)
+	tt.Key(Ctrl, KeyHome)
+	a := textAreaState(tt).editor.area
+	tt.Scroll(100, 100, 0, 50*a.line.Height+2) // 2 DIPs into paragraph 50
+	tt.Frame()
+	if a.anchor != 50 || a.first != 49 {
+		t.Errorf("the view starts in paragraph %d, the first laid out is %d", a.anchor, a.first)
+	}
+}
+
+// TestTextAreaPassword checks that a text area with Password shows a
+// bullet for each rune.
+func TestTextAreaPassword(t *testing.T) {
+	key := "-----BEGIN KEY-----\nsecret\n-----END KEY-----"
+	tt := NewTester(func(c *Context) { TextArea(c, &key).Password().Height(120) }, 400, 200)
+	ed := textAreaState(tt).editor
+	for i := range ed.buf.paras {
+		l := ed.buf.paras[i].layout
+		if want := strings.Repeat("•", utf8.RuneCountInString(ed.buf.text(i))); l == nil || string(l.Runes) != want {
+			t.Errorf("paragraph %d shows %q", i, string(l.Runes))
+		}
+	}
+}
+
+// TestTextAreaInForm checks that a field lines its label up with the first
+// line of its text area.
+func TestTextAreaInForm(t *testing.T) {
+	bio := "The first line"
+	tt := NewTester(func(c *Context) {
+		Form(c, func() {
+			Field(c, "About you", func() { TextArea(c, &bio).Height(110) })
+		})
+	}, 500, 300)
+	label, _ := tt.Find("About you")
+	st := textAreaState(tt)
+	if y := st.y + st.editor.originY; abs32(label.Y-y) > 0.5 {
+		t.Errorf("the label is at %v, the first line of the text area at %v", label.Y, y)
 	}
 }

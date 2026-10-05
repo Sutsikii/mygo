@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -22,10 +23,10 @@ import (
 type area struct {
 	hs heights
 	// params are those of the layouts, without their text; version is
-	// the buffer's the heights are of, and lineH the height of a line.
+	// the buffer's the heights are of, and line a line of an empty text.
 	params  text.Params
 	version uint64
-	lineH   float32
+	line    text.Line
 
 	scroll     float64 // the content's y at the top of the view
 	anchor     int
@@ -86,7 +87,7 @@ func (a *area) sync(b *buffer, params text.Params) {
 		a.version = 0
 		empty := params
 		empty.Text = ""
-		a.lineH = textSystem().Layout(empty).Lines[0].Height
+		a.line = textSystem().Layout(empty).Lines[0]
 	}
 	if a.version != b.version || len(a.hs.measured) != len(b.paras)+1 {
 		if a.version != b.version {
@@ -100,12 +101,13 @@ func (a *area) sync(b *buffer, params text.Params) {
 	if n := len(b.paras) - unknown; n > 0 {
 		a.hs.est = m / float64(n)
 	} else {
-		a.hs.est = float64(a.lineH)
+		a.hs.est = float64(a.line.Height)
 	}
 }
 
 // paraLayout returns the layout of paragraph p, with the composition of an
-// input method in the paragraph of the caret.
+// input method in the paragraph of the caret, and a bullet for each rune
+// of a password.
 func (a *area) paraLayout(ed *editor, p int) *text.Layout {
 	b := &ed.buf
 	pr := &b.paras[p]
@@ -120,6 +122,9 @@ func (a *area) paraLayout(ed *editor, p int) *text.Layout {
 	if compose != "" {
 		at := b.byteOf(ed.caret) - pr.byte
 		t = t[:at] + compose + t[at:]
+	}
+	if ed.password {
+		t = strings.Repeat("•", utf8.RuneCountInString(t))
 	}
 	params := a.params
 	params.Text = t
@@ -179,6 +184,15 @@ func (a *area) lineEdges(ed *editor, i int) (int, int) {
 	return a.global(ed, p, line.Start), a.global(ed, p, line.End)
 }
 
+// firstLine returns the first line of the text, or a line of an empty text
+// while the first paragraph has no layout.
+func (a *area) firstLine(b *buffer) *text.Line {
+	if l := b.paras[0].layout; l != nil {
+		return &l.Lines[0]
+	}
+	return &a.line
+}
+
 // indexAt returns the rune of the caret position closest to (x, y) in the
 // content.
 func (a *area) indexAt(ed *editor, x float32, y float64) int {
@@ -223,7 +237,9 @@ func (a *area) layout(e *Element, cw, ch float32) {
 	if st.scrollY != a.lastScroll {
 		a.setScroll(st.scrollY) // the wheel or the scroll bar
 	}
-	a.place(ed, ch)
+	// The text shows through the padding, inside the border.
+	above, below := e.pad[0], e.pad[2]
+	a.place(ed, ch, above, below)
 	if a.reveal {
 		a.reveal = false
 		_, y, h := a.caretAt(ed, ed.caret, ed.composeCaret)
@@ -231,14 +247,22 @@ func (a *area) layout(e *Element, cw, ch float32) {
 		case y < a.scroll:
 			a.setScroll(y)
 		case y+float64(h) > a.scroll+float64(ch):
+			// Measure the paragraphs above the caret's that the view will
+			// show, so that the caret ends at its bottom whatever their
+			// heights were estimated.
+			p := b.para(ed.caret)
+			for q, room := p-1, y+float64(h)-a.hs.top(p); q >= 0 && room < float64(ch); q-- {
+				room += float64(a.paraLayout(ed, q).Height)
+			}
+			_, y, h = a.caretAt(ed, ed.caret, ed.composeCaret)
 			a.setScroll(y + float64(h) - float64(ch))
 		}
-		a.place(ed, ch)
+		a.place(ed, ch, above, below)
 	}
 	total := a.hs.top(len(b.paras))
 	if s := max(0, min(a.scroll, total-float64(ch))); s != a.scroll {
 		a.setScroll(s)
-		a.place(ed, ch)
+		a.place(ed, ch, above, below)
 		total = a.hs.top(len(b.paras))
 	}
 	st.scrollTo(st.scrollX, a.scroll)
@@ -249,21 +273,26 @@ func (a *area) layout(e *Element, cw, ch float32) {
 	}
 }
 
-// place lays out the paragraphs in view, from the anchor down, and keeps
-// the view where the anchor is.
-func (a *area) place(ed *editor, ch float32) {
+// place lays out the paragraphs in view, from the anchor down, with those
+// showing in the bands above and below the view, and keeps the view where
+// the anchor is.
+func (a *area) place(ed *editor, ch, above, below float32) {
 	n := len(ed.buf.paras)
 	a.anchor = max(0, min(a.anchor, n-1))
 	a.paraLayout(ed, a.anchor)
-	// The anchor's height is known now: the place is by the paragraph the
-	// offset falls in.
-	a.setScroll(max(0, a.hs.top(a.anchor)+a.anchorOff))
 	a.first = a.anchor
+	for a.first > 0 && a.hs.top(a.anchor)+a.anchorOff-a.hs.top(a.first) < float64(above) {
+		a.first--
+		a.paraLayout(ed, a.first)
+	}
+	// The heights from the first paragraph shown are known now: the place
+	// is by the paragraph the offset falls in.
+	a.setScroll(max(0, a.hs.top(a.anchor)+a.anchorOff))
 	y := a.hs.top(a.first)
 	p := a.first
 	for ; p < n; p++ {
 		y += float64(a.paraLayout(ed, p).Height)
-		if y >= a.scroll+float64(ch) {
+		if y >= a.scroll+float64(ch+below) {
 			break
 		}
 	}

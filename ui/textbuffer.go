@@ -37,6 +37,7 @@ type paragraph struct {
 
 func (b *buffer) set(s string) {
 	b.s = s
+	clear(b.paras) // the layouts of the old text
 	b.paras = append(b.paras[:0], paragraph{})
 	r := 0
 	for i, c := range s {
@@ -93,10 +94,15 @@ func (b *buffer) byteOf(i int) int {
 // slice returns the runes from a to z.
 func (b *buffer) slice(a, z int) string { return b.s[b.byteOf(a):b.byteOf(z)] }
 
-// at returns rune i.
-func (b *buffer) at(i int) rune {
-	r, _ := utf8.DecodeRuneInString(b.s[b.byteOf(i):])
-	return r
+// runeOffset returns the byte of s rune i starts at.
+func runeOffset(s string, i int) int {
+	for at := range s {
+		if i == 0 {
+			return at
+		}
+		i--
+	}
+	return len(s)
 }
 
 // text returns paragraph p, without its newline.

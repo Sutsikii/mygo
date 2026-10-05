@@ -32,10 +32,12 @@ type editEvent struct {
 }
 
 // change is an edit of the text: the runes at at held removed, and hold
-// inserted since.
+// inserted since. A text the app set is a change of the whole text (app),
+// which typing after it does not grow.
 type change struct {
 	at                int
 	removed, inserted string
+	app               bool
 }
 
 // undoStep is what undoing takes back: the changes of an edit, or of
@@ -45,6 +47,20 @@ type undoStep struct {
 	changes                 []change
 	caret, anchor           int
 	caretAfter, anchorAfter int
+}
+
+// before returns the text before the step's changes, from the text after
+// them.
+func (s *undoStep) before(text string) string {
+	if len(s.changes) > 0 && s.changes[0].app {
+		return s.changes[0].removed
+	}
+	for i := len(s.changes) - 1; i >= 0; i-- {
+		c := s.changes[i]
+		at := runeOffset(text, c.at)
+		text = text[:at] + c.removed + text[at+len(c.inserted):]
+	}
+	return text
 }
 
 // editor is the state of a text input: the text, the caret, the selection,
@@ -71,7 +87,7 @@ type editor struct {
 	area   *area
 	// display maps runes of the text to runes of the layout, which shows
 	// bullets for passwords and holds the composition.
-	scrollX, scrollY float32
+	scrollX          float32
 	originX, originY float32 // content box, relative to the element
 	desiredX         float32
 	hasDesired       bool
@@ -88,11 +104,13 @@ type editor struct {
 func newEditor() *editor { return &editor{} }
 
 // setText gives the editor a text the app set. Undoing the last step takes
-// it back with the step, as when the app reformats what the user typed.
+// it back with the step, as when the app reformats what the user typed:
+// the step becomes one change, from the text before it, so that it keeps
+// two texts however often the app sets one, as a log does.
 func (ed *editor) setText(s string) {
 	if n := len(ed.undo); n > 0 {
 		step := &ed.undo[n-1]
-		step.changes = append(step.changes, change{at: 0, removed: ed.buf.s, inserted: s})
+		step.changes = append(step.changes[:0], change{removed: step.before(ed.buf.s), inserted: s, app: true})
 	}
 	ed.redo = ed.redo[:0]
 	ed.buf.set(s)
@@ -100,9 +118,6 @@ func (ed *editor) setText(s string) {
 	ed.anchor = min(ed.anchor, ed.buf.n)
 	if n := len(ed.undo); n > 0 {
 		ed.undo[n-1].caretAfter, ed.undo[n-1].anchorAfter = ed.caret, ed.anchor
-	}
-	if ed.area != nil {
-		ed.area.reveal = true
 	}
 }
 
@@ -207,7 +222,7 @@ func (ed *editor) replace(start, end int, s string) {
 		// Typing grows the text the step inserted.
 		grown := false
 		if k := len(step.changes); k > 0 && c.removed == "" {
-			if last := &step.changes[k-1]; last.at+utf8.RuneCountInString(last.inserted) == start {
+			if last := &step.changes[k-1]; !last.app && last.at+utf8.RuneCountInString(last.inserted) == start {
 				last.inserted += s
 				grown = true
 			}
@@ -590,6 +605,17 @@ func (ed *editor) release() { ed.dragging = false }
 // laidOut reports whether a frame laid the editor's text out.
 func (ed *editor) laidOut() bool { return ed.layout != nil || ed.area != nil && ed.area.version != 0 }
 
+// firstLine returns the first line of the text, as last laid out, or nil.
+func (ed *editor) firstLine() *text.Line {
+	switch {
+	case ed.area != nil && ed.area.version != 0:
+		return ed.area.firstLine(&ed.buf)
+	case ed.layout != nil && len(ed.layout.Lines) > 0:
+		return &ed.layout.Lines[0]
+	}
+	return nil
+}
+
 func (ed *editor) hit(x, y float32) int {
 	if a := ed.area; a != nil {
 		return a.indexAt(ed, x-ed.originX, float64(y-ed.originY)+a.scroll)
@@ -597,7 +623,7 @@ func (ed *editor) hit(x, y float32) int {
 	if ed.layout == nil {
 		return 0
 	}
-	return ed.textIndex(ed.layout.IndexAt(x-ed.originX+ed.scrollX, y-ed.originY+ed.scrollY))
+	return ed.textIndex(ed.layout.IndexAt(x-ed.originX+ed.scrollX, y-ed.originY))
 }
 
 // drag extends the selection to the pointer.
@@ -627,8 +653,8 @@ func (ed *editor) commitCompose() {
 }
 
 func (ed *editor) lineHeight() float32 {
-	if ed.area != nil && ed.area.lineH > 0 {
-		return ed.area.lineH
+	if ed.area != nil && ed.area.line.Height > 0 {
+		return ed.area.line.Height
 	}
 	if ed.layout != nil && len(ed.layout.Lines) > 0 {
 		return ed.layout.Lines[0].Height
@@ -647,7 +673,7 @@ func (ed *editor) caretRect(st *state) Rect {
 		return Rect{st.x, st.y, 1, st.h}
 	}
 	x, y, h := ed.layout.Caret(ed.displayIndex(ed.caret) + ed.composeCaret)
-	return Rect{st.x + ed.originX + x - ed.scrollX, st.y + ed.originY + y - ed.scrollY, 1, h}
+	return Rect{st.x + ed.originX + x - ed.scrollX, st.y + ed.originY + y, 1, h}
 }
 
 // process applies the input queued for the editor.
@@ -737,10 +763,13 @@ func textInputBase(c *Context, value *string, multiline bool) *Element {
 	if focused || len(ed.queue) > 0 {
 		version := ed.buf.version
 		ed.process(c, e)
-		if ed.buf.version != version && ed.buf.s != *value {
+		if ed.buf.version != version {
+			if ed.buf.s != *value {
+				st.changed = true
+				c.rt.consumed = true
+			}
+			// Equal or not, the value shares the text's string again.
 			*value = ed.buf.s
-			st.changed = true
-			c.rt.consumed = true
 		}
 	}
 	if !focused {
@@ -842,32 +871,19 @@ func (e *Element) layoutInput(cw, ch float32) {
 	ed.layout = l
 	ed.contentW = cw
 	ed.originX, ed.originY = e.contentX(), e.contentY()
-	if ed.multiline && len(l.Lines) > 0 && l.Height < ch {
-		// Center a single line vertically in a taller box.
-		_ = ch
-	}
-	if !ed.multiline && len(l.Lines) > 0 {
+	// A single line, centered vertically in a taller box: text areas lay
+	// out in area.
+	if len(l.Lines) > 0 {
 		ed.originY += max((ch-l.Lines[0].Height)/2, 0)
 	}
 	// Keep the caret in view.
-	x, y, h := l.Caret(ed.displayIndex(ed.caret) + ed.composeCaret)
-	if ed.multiline {
-		ed.scrollX = 0
-		if y-ed.scrollY < 0 {
-			ed.scrollY = y
-		} else if y+h-ed.scrollY > ch {
-			ed.scrollY = y + h - ch
-		}
-		ed.scrollY = max(0, min(ed.scrollY, max(l.Height-ch, 0)))
-	} else {
-		ed.scrollY = 0
-		if x-ed.scrollX < 0 {
-			ed.scrollX = x
-		} else if x-ed.scrollX > cw-1 {
-			ed.scrollX = x - cw + 1
-		}
-		ed.scrollX = max(0, min(ed.scrollX, max(l.Width-cw+1, 0)))
+	x, _, _ := l.Caret(ed.displayIndex(ed.caret) + ed.composeCaret)
+	if x-ed.scrollX < 0 {
+		ed.scrollX = x
+	} else if x-ed.scrollX > cw-1 {
+		ed.scrollX = x - cw + 1
 	}
+	ed.scrollX = max(0, min(ed.scrollX, max(l.Width-cw+1, 0)))
 }
 
 func (e *Element) paintInput(p *Painter) {
@@ -881,7 +897,7 @@ func (e *Element) paintInput(p *Painter) {
 	clip := Rect{e.x + e.border[3], e.y + e.border[0], e.w - e.border[1] - e.border[3], e.h - e.border[0] - e.border[2]}
 	saved := p.clip
 	p.pushClip(clip, [4]float32{})
-	ox, oy := e.x+ed.originX-ed.scrollX, e.y+ed.originY-ed.scrollY
+	ox, oy := e.x+ed.originX-ed.scrollX, e.y+ed.originY
 	focused := e.Focused()
 	ts := e.resolvedText()
 	if ed.buf.n == 0 && ed.compose == "" && ed.placeholder != "" {

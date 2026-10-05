@@ -1208,8 +1208,11 @@ either.
   compares the value with it at once while it is the same string, and an
   edit copies the bytes once, where converting the whole text between
   runes and a string took milliseconds for a few megabytes. Undo keeps the
-  changes of each step (`undoStep`), not copies of the text, and grapheme
-  boundaries come from the paragraph of the caret. A text area lays its
+  changes of each step (`undoStep`), not copies of the text; a text the app
+  sets makes the last step one change from the text before it, which
+  undoing takes back, so that a log the app keeps setting holds two texts
+  there, not one a frame. Grapheme boundaries come from the paragraph of
+  the caret. A text area lays its
   text out a paragraph at a time (`area`), as the text system breaks
   lines anyway, so that the lines are those of the text laid out whole:
   each paragraph keeps its layout until an edit changes it or the width
