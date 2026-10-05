@@ -25,7 +25,11 @@ ui.TextArea(c, &app.notes).Height(160)
 - `Disabled(true)` grays it out.
 
 A text area is at least a few lines high and grows with its text; given a
-height, it scrolls within it.
+height, it scrolls within it, with the wheel and a scroll bar, and keeps
+the caret in view as it moves. It lays out only the paragraphs in view and
+keeps their layouts until they change, so that it holds texts of hundreds
+of thousands of lines, as a log or a source file, and stays as quick to
+type in.
 
 ## Editing
 
