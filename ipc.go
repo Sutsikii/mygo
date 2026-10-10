@@ -446,6 +446,10 @@ func (e *Event[T]) Emit(w *Window, payload T) error {
 		return errDestroyed
 	}
 	w.enqueue(msg, true)
+	// Browser tabs of `mygo dev` stand in for the window too.
+	for _, l := range browserTabsOf(w, false) {
+		l.enqueue(msg, true)
+	}
 	return nil
 }
 
@@ -457,6 +461,9 @@ func (e *Event[T]) Broadcast(payload T) error {
 	}
 	for _, w := range Windows() {
 		w.enqueue(msg, true)
+	}
+	for _, l := range browserTabsOf(nil, true) {
+		l.enqueue(msg, true)
 	}
 	return nil
 }
