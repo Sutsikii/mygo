@@ -1,7 +1,7 @@
 # Getting started
 
 A MyGo app shows its windows with a web frontend, in the system's webview,
-or with [native UI](ui.md) that MyGo draws itself, written in Go. `mygo
+or with [native UI](ui/README.md) that MyGo draws itself, written in Go. `mygo
 init` starts a project of either kind, and an app can add windows of the
 other kind later.
 
@@ -74,7 +74,7 @@ the development app to `.mygo/`; `.gitignore` leaves them out. See
 ### Native UI
 
 `mygo init -template native my-app` creates an app whose window shows
-[native UI](ui.md): a Go module alone, with no frontend and no Bun.
+[native UI](ui/README.md): a Go module alone, with no frontend and no Bun.
 
 ```
 my-app/
@@ -101,8 +101,8 @@ go tool mygo dev   # native UI
 
 `mygo dev` builds a development version of the app and starts it, then
 rebuilds and restarts it when you edit a `.go` file, the configuration, the
-icon or a resource. A build that fails, or crashes on start, keeps the
-previous one running. Quit the app, or press Ctrl+C, to stop.
+icon or a resource. A build that fails to compile keeps the previous one
+running. Quit the app, or press Ctrl+C, to stop.
 
 With a web frontend, it also writes `src/mygo.ts` and starts the Vite dev
 server, from which the development app loads its pages: edit `src/main.ts`
@@ -175,7 +175,7 @@ func (a *app) view(c *ui.Context) {
 ```
 
 `main_test.go` clicks and types into the view without a window, as fast as
-a unit test: run `go test`. [Native UI](ui.md) covers layout, widgets,
+a unit test: run `go test`. [Native UI](ui/README.md) covers layout, widgets,
 text, input, drawing and changing the state from other goroutines.
 
 ## Build
@@ -191,8 +191,8 @@ it when there is one, and packages it for the machine's platform in
 
 | Platform | Output |
 |---|---|
-| macOS | `My App.app`, and a disk image `My App 0.1.0.dmg` |
-| Windows | `My App.exe`, and an installer `My App Setup 0.1.0.exe` |
+| macOS | `My App.app`, and a disk image `My App 0.1.0 arm64.dmg` |
+| Windows | `My App.exe`, and an installer `My App Setup 0.1.0 amd64.exe` |
 | Linux | the executable `my-app` with its desktop entry and icon, their archive with `install.sh`, which installs it for the user, and a `.deb` package |
 
 MyGo needs no cgo, so any machine builds for every platform:
@@ -208,16 +208,22 @@ The apps run where they are, but to ship them to users, sign them: see
 ## Next steps
 
 - [Windows](windows.md) and [the application](app.md), to shape the app.
-- [Native UI](ui.md), to build interfaces in Go, or
+- [Native UI](ui/README.md), to build interfaces in Go, or
   [the frontend](frontend.md), for web pages.
 - [Menus and the tray](menus.md) and the [desktop APIs](native.md).
 - The examples in the repository:
   - with web pages: `examples/hello` (the smallest app), `examples/todo`
     (typed services and events, persistence, dialogs, menus, several
-    windows), `examples/frameless` (a custom title bar),
-    `examples/vibrancy` (a translucent sidebar under an inset title bar)
-    and `examples/native` (menus, a tray icon, dialogs, notifications, a
+    windows), `examples/frameless` (a custom title bar) and
+    `examples/native` (menus, a tray icon, dialogs, notifications, a
     global shortcut, the clipboard and dark mode);
-  - with native UI: `examples/counter-native` (a counter with a test of its
-    view) and `examples/gallery` (a tour of the toolkit: layout, widgets,
-    text editing, a list of ten thousand rows, drawing and overlays).
+  - with native UI: `examples/clipboard` (copying and dragging text, HTML,
+    lazy JSON, and file lists), `examples/counter-native` (a counter with a test of its
+    view), `examples/vibrancy` (a translucent sidebar under an inset title
+    bar, its material picked in it), `examples/effort-slider` (a web
+    demo's animated slider redrawn: letters blurring in, a burst of
+    pixels, a shaking card), `examples/confetti` (canvas-confetti's
+    demos, every piece flying on poses that only paint) and
+    `examples/gallery` (a tour of the
+    toolkit: layout, widgets, text editing, a list of ten thousand rows,
+    drawing and overlays).

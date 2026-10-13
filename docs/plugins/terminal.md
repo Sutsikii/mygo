@@ -1,6 +1,6 @@
 # Terminal
 
-The terminal plugin is a terminal for apps of [native UI](../ui.md): a view
+The terminal plugin is a terminal for apps of [native UI](../ui/README.md): a view
 that runs the user's shell, or any program, in a pseudo-terminal, with the
 terminal emulator of [Ghostty](https://ghostty.org), libghostty-vt. It is
 all Go, with no npm package: the emulator is a native library that the
@@ -38,12 +38,8 @@ func main() {
 }
 ```
 
-`examples/terminal` is this app, whose window takes the shell's title and
-closes when the shell exits:
-
-```sh
-go run ./examples/terminal
-```
+The [terminal example](../../examples/terminal) shows this app. Its window
+uses the shell's title and closes when the shell exits.
 
 `terminal.View` is an element like any other: size it with `Fill` or
 `Grow`, and put it next to other elements, as in a pane of an editor. Its
@@ -87,7 +83,8 @@ The terminal does what terminal apps do:
   arrow keys, or as mouse reports when they take the mouse. Typing scrolls
   back to the bottom.
 - **Links**: Command+click (Control+click elsewhere) opens a hyperlink a
-  program printed (OSC 8).
+  program printed (OSC 8), or a URL printed as text, even while a program
+  takes the mouse; the pointer is a hand over them while Command is held.
 - Shortcuts of the app come first: Command shortcuts on macOS are never
   sent to the program, and keys that the window or an element around the
   terminal handles with `Shortcut` go there.
@@ -127,6 +124,10 @@ term, err := terminal.New(terminal.Options{
 - `Cursor` and `NoBlink` set the cursor, which programs may change.
 - `Scrollback` is about how many bytes of output to keep above the
   screen: 10 MB by default, none when negative.
+- `Transparent` leaves the background undrawn, as Ghostty's
+  `background-opacity`, so that what is under the view shows through: the
+  window's material, or an element's translucent background. Cells with a
+  background color of their own still draw it.
 - `OptionAsAlt` makes Option on macOS the Alt key of programs (Meta),
   instead of the key typing accented letters.
 - `OnTitle`, `OnExit`, `OnBell` and `OnNotify` run on a goroutine of the
@@ -134,6 +135,33 @@ term, err := terminal.New(terminal.Options{
   for a desktop notification. `Done` is closed once the program exited,
   and `ExitCode` returns its code (-1 for a program that could not
   start); the terminal then shows "[Process exited]".
+- `OpenLink` takes the links Command+click opens, on the main thread,
+  and with it file paths printed as text too (`/abs/path`, `~/notes.md`,
+  `./a.go`, `src/app.go:12:3`, `main.go:250`), as printed: a relative
+  path is the program's, as of `Dir`. It reports whether it opened the
+  link; a hyperlink or a URL it leaves opens with the system, as every one
+  does without `OpenLink`. An app opens a remote shell's paths in a
+  preview of its own this way, rather than the system opening them
+  locally.
+- `OnPaste` sees a paste, by the keys or a Paste menu item, on the main
+  thread, with the clipboard's text (empty when it holds none, as with an
+  image), and takes it by returning true: nothing is pasted. An app
+  driving a remote shell uploads the clipboard's files this way and
+  pastes their remote paths instead.
+- `OnKey` sees a key press on the main thread before the terminal sends
+  it, and takes it by returning true: neither the key nor the text it
+  types reaches the program. Unlike a `Shortcut` around the view, which
+  runs with the next frame, it keeps its place among the keys typed after
+  it, as does what it sends with `Send`. Keys that only type text may come
+  as their text alone, as on Linux, and `OnKey` does not see those.
+- `OnScroll` sees the wheel scroll the view by whole rows (negative up)
+  on the main thread before the terminal scrolls its scrollback, and
+  takes it by returning true: the scrollback stays. It is not asked while
+  a program gets the wheel: as mouse reports when it takes the mouse
+  (unless Shift is held), or as arrow keys on a full-screen program's
+  screen (alternate scroll, which `\x1b[?1007l` turns off). A `Conn`
+  whose history lives at the other end, as a remote multiplexer streaming
+  only its screen, sends the wheel there this way.
 
 ## Fonts
 
@@ -229,6 +257,11 @@ The terminal's methods are safe from any goroutine:
 - `Title`, `Dir` (the directory the shell reported), `Size` (in cells) and
   `Text` (the screen and its scrollback) read the terminal.
 - `SetFont` and `SetTheme` change the font and the colors.
+- `Resize` sets the size of a terminal no view shows, and `Snapshot`
+  returns what a terminal shows as escape sequences: its scrollback and
+  screen with their styles, the cursor and the modes programs set. Fed to
+  a new terminal of the same size, it shows the same, as when a server
+  keeps a session's screen for the windows that attach to it.
 - `Close` hangs up the program, which gets SIGHUP, and frees the terminal.
 
 ## Without a program
@@ -260,13 +293,19 @@ A program not built by the CLI, as under `go run` and `go test`, downloads
 the library once into the user's cache (`<cache>/mygo/natives/`), where
 the CLI keeps those it downloads, and checks its SHA-256. Packaged apps
 never download it. `terminal.LibraryPath` returns the library a program
-loads, and `$MYGO_GHOSTTY_VT` names another, such as one you built:
+loads, and `$MYGO_GHOSTTY_VT` names another library.
+
+<!-- repository-only:start -->
+
+To build libghostty-vt from Ghostty's sources:
 
 ```sh
 git clone https://github.com/ghostty-org/ghostty && cd ghostty
 zig build -Demit-lib-vt -Doptimize=ReleaseFast
 MYGO_GHOSTTY_VT=$PWD/zig-out/lib/libghostty-vt.dylib go run ./examples/terminal
 ```
+
+<!-- repository-only:end -->
 
 `terminal.Load` loads the library, which `New` does too: call it first to
 report a missing library before showing a window.

@@ -3,6 +3,7 @@ package raster
 import (
 	"bytes"
 	"fmt"
+	"image"
 	"math/rand/v2"
 	"testing"
 
@@ -16,6 +17,8 @@ type sceneMaker struct {
 	img   *scene.Image
 	// masks are rectangles of the atlas holding something.
 	masks [][4]uint16
+	// effects has op make effects too.
+	effects bool
 }
 
 func newSceneMaker(seed uint64) *sceneMaker {
@@ -51,6 +54,18 @@ func (m *sceneMaker) rect() scene.Rect {
 
 // op returns a random operation that draws.
 func (m *sceneMaker) op(s *scene.Scene) scene.Op {
+	if m.effects && m.rnd.IntN(4) == 0 {
+		r := m.rnd.Float32() * 20
+		fx := scene.EffectOp{Effect: lensEffect, Blur: float32(m.rnd.IntN(4)) * 3}
+		if m.rnd.IntN(3) == 0 {
+			fx.Effect = tintEffect
+		}
+		fx.Params[0] = [4]float32{m.rnd.Float32() * 4}
+		c := m.color()
+		fx.Params[1] = [4]float32{float32(c.R) / 255, float32(c.G) / 255, float32(c.B) / 255, float32(c.A) / 255}
+		s.Effects = append(s.Effects, fx)
+		return scene.Op{Kind: scene.OpEffect, Rect: m.rect(), Radii: [4]float32{r, r, r, r}, Start: int32(len(s.Effects) - 1)}
+	}
 	switch m.rnd.IntN(4) {
 	case 0:
 		r := m.rnd.Float32() * 12
@@ -142,8 +157,19 @@ func (m *sceneMaker) change(s *scene.Scene) string {
 }
 
 func TestRendererRedrawsWhatChanged(t *testing.T) {
+	testRedraws(t, false)
+}
+
+// TestRendererRedrawsEffects checks that effects, and what is under those
+// reading their backdrops, show however little of the window changes.
+func TestRendererRedrawsEffects(t *testing.T) {
+	testRedraws(t, true)
+}
+
+func testRedraws(t *testing.T, effects bool) {
 	for seed := range uint64(40) {
 		m := newSceneMaker(seed)
+		m.effects = effects
 		s := m.scene()
 		var r Renderer
 		full := NewImage(s.Width, s.Height)
@@ -185,31 +211,42 @@ func TestRendererSkipsUnchangedScenes(t *testing.T) {
 	}
 }
 
-// TestChanges checks that Changes tells how much Render then draws.
-func TestChanges(t *testing.T) {
-	fill := func(x float32) *scene.Scene {
-		return &scene.Scene{Width: 200, Height: 100, Clear: scene.Color{R: 255, G: 255, B: 255, A: 255}, Ops: []scene.Op{
-			{Kind: scene.OpFill, Rect: scene.Rect{X: 10, Y: 10, W: 50, H: 50}, Color: scene.Color{R: 255, A: 255}},
-			{Kind: scene.OpFill, Rect: scene.Rect{X: x, Y: 70, W: 10, H: 10}, Color: scene.Color{B: 255, A: 255}},
-		}}
+// TestBandsDrawAsOne checks that a large area drawn in bands on several
+// cores, leaving out the operations each band misses, has the pixels of
+// the area drawn at once with every operation.
+func TestBandsDrawAsOne(t *testing.T) {
+	m := newSceneMaker(3)
+	for i := range 6 {
+		s := scaled(m.scene(), 8)
+		got := NewImage(s.Width, s.Height)
+		Render(got, s)
+		all := make([]image.Rectangle, len(s.Ops))
+		for j := range all {
+			all[j] = image.Rect(0, 0, s.Width, s.Height)
+		}
+		want := NewImage(s.Width, s.Height)
+		var r renderer
+		r.render(want, s, image.Rect(0, 0, s.Width, s.Height), all, 0, len(s.Ops), nil, nil)
+		if !bytes.Equal(got.Pix, want.Pix) {
+			t.Errorf("scene %d: drawn in bands, its pixels differ", i)
+		}
 	}
-	var r Renderer
-	if n := r.Changes(fill(100)); n != 200*100 {
-		t.Errorf("before a first scene: %d pixels", n)
+}
+
+// scaled returns s k times as large, its glyphs as large as they were.
+func scaled(s *scene.Scene, k float32) *scene.Scene {
+	s.Width, s.Height = s.Width*int(k), s.Height*int(k)
+	for i := range s.Ops {
+		op := &s.Ops[i]
+		op.Rect = scene.Rect{X: op.Rect.X * k, Y: op.Rect.Y * k, W: op.Rect.W * k, H: op.Rect.H * k}
+		op.Blur *= k
+		for j := range op.Radii {
+			op.Radii[j] *= k
+		}
 	}
-	r.Render(fill(100))
-	if n := r.Changes(fill(100)); n != 0 {
-		t.Errorf("the same scene: %d pixels", n)
+	for i := range s.Glyphs {
+		s.Glyphs[i].X *= k
+		s.Glyphs[i].Y *= k
 	}
-	n := r.Changes(fill(120))
-	if n == 0 || n > 2*12*12 {
-		t.Errorf("a small square moved: %d pixels", n)
-	}
-	area := 0
-	for _, d := range r.Render(fill(120)) {
-		area += d.Dx() * d.Dy()
-	}
-	if area != n {
-		t.Errorf("Render drew %d pixels, Changes said %d", area, n)
-	}
+	return s
 }

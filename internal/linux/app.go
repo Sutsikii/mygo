@@ -22,9 +22,19 @@ type Backend struct {
 	name    string
 	running bool
 
-	windows   map[int]*window
+	windows map[int]*window
+	// flyouts are the flyouts that show on Wayland, in the order they
+	// showed: each popup's parent is the one before or a toplevel.
+	flyouts   []*window
 	byWebView map[ptr]*window
-	nextID    int
+	// webViews are the web views under surfaces (webview.go), by id.
+	webViews map[int]*window
+	nextID   int
+	// frames are the window manager's frames seen last around a decorated
+	// window in its normal state that the user cannot resize and one they
+	// can, which windows that have not shown yet expect (see
+	// window.frameExtents).
+	frames [2]extents
 
 	appMenu    *platform.Menu
 	schemes    map[string]bool
@@ -44,6 +54,9 @@ type Backend struct {
 	// compositorDecorates reports a Wayland compositor that decorates
 	// windows itself, whose title bar shows no buttons of GTK's (titlebar.go).
 	compositorDecorates bool
+	// announceCSD tells a Wayland compositor that a window decorates
+	// itself, so that it draws no title bar (gdk_wayland_window_announce_csd).
+	announceCSD func(window ptr)
 
 	// What the launcher entry shows (Window.SetProgressBar, badges).
 	launcher struct {
@@ -61,6 +74,7 @@ func New() *Backend {
 	return &Backend{
 		windows:   map[int]*window{},
 		byWebView: map[ptr]*window{},
+		webViews:  map[int]*window{},
 		schemes:   map[string]bool{},
 		trays:     map[int]*tray{},
 	}
@@ -103,9 +117,13 @@ func (b *Backend) Init(h platform.AppHandler, opts platform.AppOptions) error {
 	// open, and decides with it which windows it decorates.
 	var waylandType func() uintptr
 	var prefersSSD func(display ptr) bool
-	b.compositorDecorates = bind(libGDK, &waylandType, "gdk_wayland_display_get_type") &&
-		gTypeCheckInstanceIsA(gdkDisplayGetDefault(), waylandType()) &&
+	onWayland := bind(libGDK, &waylandType, "gdk_wayland_display_get_type") &&
+		gTypeCheckInstanceIsA(gdkDisplayGetDefault(), waylandType())
+	b.compositorDecorates = onWayland &&
 		bind(libGDK, &prefersSSD, "gdk_wayland_display_prefers_ssd") && prefersSSD(gdkDisplayGetDefault())
+	if onWayland {
+		bind(libGDK, &b.announceCSD, "gdk_wayland_window_announce_csd")
+	}
 	initCallbacks()
 	return nil
 }
@@ -197,10 +215,12 @@ func initCallbacks() {
 			return 0
 		})
 		initWindowCallbacks()
+		initFlyoutCallbacks()
 		initSurfaceCallbacks()
 		initDownloadCallbacks()
 		initMenuCallbacks()
 		initSystemCallbacks()
+		initClipboardCallbacks()
 	})
 }
 

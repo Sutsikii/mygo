@@ -10,12 +10,12 @@ import (
 func TestTabs(t *testing.T) {
 	tab := 0
 	changes := 0
-	tt := NewTester(func(c *Context) {
-		Column(c).Padding(10).Children(func() {
-			if Tabs(c, &tab, "One", "Two", "Three").Changed() {
+	tt := coreNewTester(func(c *context) {
+		coreColumn(c).Padding(10).Children(func() {
+			if coreTabs(c, &tab, "One", "Two", "Three").Changed() {
 				changes++
 			}
-			Textf(c, "page %d", tab)
+			coreTextf(c, "page %d", tab)
 		})
 	}, 400, 200)
 	if err := tt.Click("Two"); err != nil {
@@ -60,8 +60,8 @@ func TestTabs(t *testing.T) {
 
 func TestSplit(t *testing.T) {
 	size := float32(120)
-	tt := NewTester(func(c *Context) {
-		Split(c, &size, func() { Text(c, "left") }, func() { Text(c, "right") }).Fill()
+	tt := coreNewTester(func(c *context) {
+		coreSplit(c, &size, func() { coreText(c, "left") }, func() { coreText(c, "right") }).Fill()
 	}, 400, 200)
 	if r, _ := tt.Find("right"); r.X < 120+1-0.5 || r.X > 120+1+0.5 {
 		t.Fatalf("the second pane starts at %v", r.X)
@@ -98,11 +98,35 @@ func TestSplit(t *testing.T) {
 	}
 }
 
+func TestSplitVertical(t *testing.T) {
+	size := float32(60)
+	tt := coreNewTester(func(c *context) {
+		coreSplitVertical(c, &size, func() { coreText(c, "top") }, func() { coreText(c, "bottom") }).Fill()
+	}, 300, 200)
+	// The second pane starts below the divider and fits in the window.
+	if r, _ := tt.Find("bottom"); r.Y < 60+1-0.5 || r.Y > 60+1+0.5 {
+		t.Fatalf("the second pane starts at %v", r.Y)
+	}
+	n := 0
+	for e := tt.rt.c.root.first; e != nil; e = e.next {
+		n++
+	}
+	if n != 1 {
+		t.Errorf("the split built %d elements in the root", n)
+	}
+	tt.Press(100, 61)
+	tt.Move(100, 101)
+	tt.Release(100, 101)
+	if size != 100 {
+		t.Errorf("dragged 40 DIPs down, the first pane is %v high", size)
+	}
+}
+
 func TestNumberInput(t *testing.T) {
 	v := 5.0
-	tt := NewTester(func(c *Context) {
-		Column(c).Padding(10).AlignItems(Start).Children(func() {
-			NumberInput(c, &v, 0, 10, 0.5).Label("Count")
+	tt := coreNewTester(func(c *context) {
+		coreColumn(c).Padding(10).AlignItems(Start).Children(func() {
+			coreNumberInput(c, &v, 0, 10, 0.5).Label("Count")
 		})
 	}, 400, 100)
 	if err := tt.Click("Increase"); err != nil {
@@ -138,8 +162,8 @@ func TestNumberInput(t *testing.T) {
 }
 
 func TestToast(t *testing.T) {
-	tt := NewTester(func(c *Context) {
-		if Button(c, "Save").Clicked() {
+	tt := coreNewTester(func(c *context) {
+		if coreButton(c, "Save").Clicked() {
 			c.Toast("Saved")
 		}
 	}, 400, 300)
@@ -168,13 +192,13 @@ func TestTable(t *testing.T) {
 	sel, opened := -1, -1
 	s := ListState{Selected: &sel}
 	cols := []TableColumn{{Title: "Name"}, {Title: "Size", Width: 80, Align: End}}
-	tt := NewTester(func(c *Context) {
-		Column(c).Fill().Padding(10).Children(func() {
-			if Table(c, &s, cols, len(names), func(row, col int) {
+	tt := coreNewTester(func(c *context) {
+		coreColumn(c).Fill().Padding(10).Children(func() {
+			if coreTable(c, &s, cols, len(names), func(row, col int) {
 				if col == 0 {
-					Text(c, names[row])
+					coreText(c, names[row])
 				} else {
-					Textf(c, "%d KB", row)
+					coreTextf(c, "%d KB", row)
 				}
 			}).Grow(1).Submitted() {
 				opened = sel
@@ -218,20 +242,20 @@ func TestTableRows(t *testing.T) {
 	s := ListState{Header: header}
 	headerCols := 0
 	cols := []TableColumn{{Title: "Name"}, {Title: "Notes", Width: 120}}
-	tt := NewTester(func(c *Context) {
-		Table(c, &s, cols, 1000, func(row, col int) {
+	tt := coreNewTester(func(c *context) {
+		coreTable(c, &s, cols, 1000, func(row, col int) {
 			switch {
 			case header(row):
 				if col != 0 {
 					headerCols++
 				}
-				Textf(c, "Section %d", row/10)
+				coreTextf(c, "Section %d", row/10)
 			case col == 0:
-				Textf(c, "Row %d", row)
+				coreTextf(c, "Row %d", row)
 			case row%7 == 0:
-				Text(c, "A note long enough to wrap over a few lines of its column")
+				coreText(c, "A note long enough to wrap over a few lines of its column")
 			default:
-				Text(c, "Short")
+				coreText(c, "Short")
 			}
 		}).Grow(1)
 	}, 400, 600)
@@ -267,10 +291,10 @@ func TestTableRows(t *testing.T) {
 func TestTree(t *testing.T) {
 	srcOpen, cmdOpen := false, true
 	var clicked string
-	tt := NewTester(func(c *Context) {
-		Tree(c, func() {
+	tt := coreNewTester(func(c *context) {
+		coreTree(c, func() {
 			item := func(label string, open *bool, children func()) {
-				if TreeItem(c, label, open, children).Selected(clicked == label).Clicked() {
+				if coreTreeItem(c, label, open, children).Selected(clicked == label).Clicked() {
 					clicked = label
 				}
 			}
@@ -327,9 +351,9 @@ func TestTree(t *testing.T) {
 func TestDateInput(t *testing.T) {
 	date := time.Date(2026, 10, 3, 9, 30, 0, 0, time.UTC)
 	changes := 0
-	tt := NewTester(func(c *Context) {
-		Column(c).Padding(10).AlignItems(Start).Children(func() {
-			if DateInput(c, &date).Label("Due").Changed() {
+	tt := coreNewTester(func(c *context) {
+		coreColumn(c).Padding(10).AlignItems(Start).Children(func() {
+			if coreDateInput(c, &date).Label("Due").Changed() {
 				changes++
 			}
 		})
@@ -372,8 +396,8 @@ func TestDateInput(t *testing.T) {
 
 func TestDateInputWide(t *testing.T) {
 	date := time.Date(2026, 10, 3, 0, 0, 0, 0, time.UTC)
-	tt := NewTester(func(c *Context) {
-		Column(c).Padding(10).Children(func() { DateInput(c, &date).Label("Due") })
+	tt := coreNewTester(func(c *context) {
+		coreColumn(c).Padding(10).Children(func() { coreDateInput(c, &date).Label("Due") })
 	}, 800, 420)
 	tt.Click("Due")
 	field, _ := tt.Find("Due")
@@ -388,9 +412,9 @@ func TestDateInputWide(t *testing.T) {
 
 func TestProgressReverse(t *testing.T) {
 	for _, reverse := range []bool{false, true} {
-		img := Render(func(c *Context) {
-			Column(c).Padding(10).Children(func() {
-				bar := Progress(c, 0.25).Height(10)
+		img := coreRender(func(c *context) {
+			coreColumn(c).Padding(10).Children(func() {
+				bar := coreProgress(c, 0.25).Height(10)
 				if reverse {
 					bar.Reverse()
 				}
@@ -406,5 +430,68 @@ func TestProgressReverse(t *testing.T) {
 		if filled(20) == reverse || filled(200) != reverse || filled(110) {
 			t.Errorf("reverse %v: filled at 20 %v, at 110 %v, at 200 %v", reverse, filled(20), filled(110), filled(200))
 		}
+	}
+}
+
+func TestTooltipHidesOnPress(t *testing.T) {
+	tt := coreNewTester(func(c *context) {
+		coreRow(c).Gap(40).Padding(40).Children(func() {
+			coreButton(c, "Save").Tooltip("Save the file")
+			coreMenuButton(c, "More", func(m *Menu) { m.Item("Duplicate") }).Tooltip("More actions")
+		})
+	}, 400, 200)
+	rest := func(x, y float32) {
+		tt.Move(x, y)
+		tt.rt.tips.hoverSince = time.Now().Add(-time.Second)
+		tt.Frame()
+	}
+	r, _ := tt.Find("Save")
+	x, y := center(r)
+	rest(x, y)
+	if !tt.HasText("Save the file") {
+		t.Fatal("no tooltip over the button")
+	}
+	// A click hides it, and it stays hidden while the pointer rests on
+	// the button.
+	tt.ClickAt(x, y)
+	rest(x+2, y)
+	if tt.HasText("Save the file") {
+		t.Error("the tooltip shows again after a click")
+	}
+	// It shows again as the pointer comes back.
+	rest(5, 5)
+	rest(x, y)
+	if !tt.HasText("Save the file") {
+		t.Error("no tooltip as the pointer comes back")
+	}
+	// A click by the keys closes it too.
+	tt.Key(0, KeyEnter)
+	if tt.HasText("Save the file") {
+		t.Error("the tooltip shows after Enter clicked the button")
+	}
+	// A press before it shows keeps it from showing.
+	rest(5, 5)
+	tt.Move(x, y)
+	tt.ClickAt(x, y)
+	rest(x, y)
+	if tt.HasText("Save the file") {
+		t.Error("the tooltip shows after a click before the delay")
+	}
+	// The press opening a menu button's menu closes it.
+	r, _ = tt.Find("More")
+	x, y = center(r)
+	rest(x, y)
+	if !tt.HasText("More actions") {
+		t.Fatal("no tooltip over the menu button")
+	}
+	tt.Press(x, y)
+	if tt.Menu() == nil || tt.HasText("More actions") {
+		t.Errorf("menu %q; the tooltip shows with the menu", tt.Menu())
+	}
+	tt.Release(x, y)
+	tt.CloseMenu()
+	rest(x, y)
+	if tt.HasText("More actions") {
+		t.Error("the tooltip shows again after the menu")
 	}
 }

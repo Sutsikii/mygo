@@ -17,22 +17,30 @@ type window struct {
 	opts   *platform.WindowOptions
 	hwnd   uintptr
 	parent *window
+	// flyout is how a flyout (WindowOptions.Flyout) was placed last, at
+	// flyoutSize.
+	flyout     platform.Flyout
+	flyoutSize platform.Size
 
 	// The WebView2 controller is created asynchronously; calls that need
-	// it wait in pending until it exists.
-	controller uintptr // ICoreWebView2Controller
-	webview    uintptr // ICoreWebView2
-	settings   uintptr // ICoreWebView2Settings
-	ready      bool
-	pending    []func()
-	closed     bool
-	destroying bool
+	// it wait in pending until it exists, or fail with webViewErr, why it
+	// could not be created.
+	controller   uintptr // ICoreWebView2Controller
+	webview      uintptr // ICoreWebView2
+	settings     uintptr // ICoreWebView2Settings
+	ready        bool
+	pending      []pendingCall
+	webViewErr   error
+	webViewFails int // creations that failed
+	closed       bool
+	destroying   bool
 
 	minW, minH, maxW, maxH int // DIPs
 	movable, closable      bool
 	frameless              bool
 	hiddenTitleBar         bool        // a TitleBarStyle that hides the caption
 	caption                *captionBar // the controls in its place, nil if they failed
+	noRedirect             bool        // no redirection bitmap, for a material behind the page
 	fullScreen             bool
 	reframing              bool     // SetFullScreen is changing the frame
 	showMaximized          bool     // on the first show (WindowOptions.Maximized)
@@ -45,7 +53,21 @@ type window struct {
 	icons [2]uintptr // small and big, from SetIcon
 	// surface shows the content MyGo draws, in place of the webview.
 	surface *surface
-	saved   struct {
+	// webViews are the web views under the surface (webview_embed.go), and
+	// host the window whose surface a web view is under, which shows it
+	// through its composition controller comp (comp3 its drag and drop,
+	// on runtimes having it; uia the provider of its page for UI
+	// Automation), in the visual webVis inside clipVis, at frame clipped
+	// to clip while shown. focused tells that it has the keyboard, and
+	// cursor is the cursor its page wants.
+	webViews         []*window
+	host             *window
+	comp, comp3, uia uintptr
+	clipVis, webVis  uintptr
+	frame, clip      platform.RectF
+	shown, focused   bool
+	cursor           uintptr
+	saved            struct {
 		style, exStyle uintptr
 		placement      windowPlacement
 	}
@@ -73,6 +95,7 @@ type window struct {
 	zoom         float64
 	devTools     bool
 	htmlFor      map[string]string // LoadHTML documents by the URL they load at
+	htmlNext     bool              // LoadHTML started the next navigation
 	calls        map[int]func(string, error)
 	nextCall     int
 }
@@ -91,17 +114,45 @@ func (b *Backend) NewWindow(o *platform.WindowOptions, h platform.WindowHandler)
 		htmlFor: map[string]string{}, calls: map[int]func(string, error){},
 	}
 	w.hiddenTitleBar = !o.Frameless && (o.TitleBarStyle == "hidden" || o.TitleBarStyle == "hiddenInset")
+	// A page or native UI with a material behind it needs a window without
+	// a redirection bitmap, whose opaque surface would cover the system
+	// backdrop. GDI draws nothing there: the controls of a hidden title bar
+	// and the frames of native UI show through DirectComposition
+	// (compositor.go, and the renderer's swap chain), and the menus open in
+	// a popup (barless). Where DirectComposition is unavailable, the window
+	// keeps its bitmap: what it shows shows, and the material does not. The
+	// style is the window's for life: Windows neither adds it nor removes it
+	// later.
+	w.noRedirect = o.Vibrancy != "" && systemBackdrops() && (!w.hiddenTitleBar && !o.Surface || b.composition() != nil)
+	if o.Flyout != nil {
+		// What the content leaves transparent shows what is behind.
+		w.noRedirect = b.composition() != nil
+	}
 	var owner uintptr
 	if p, ok := o.Parent.(*window); ok && p != nil && !p.closed {
 		w.parent, owner = p, p.hwnd
 	}
 	style, ex := w.styles()
-	w.hwnd = createWindow(ex, windowClass, o.Title, style, 0, 0, 0, 0, owner)
+	class := windowClass
+	if o.Flyout != nil {
+		style, ex = w.flyoutStyles()
+		if o.HasShadow {
+			class = flyoutShadowClass
+		}
+	}
+	w.hwnd = createWindow(ex, class, o.Title, style, 0, 0, 0, 0, owner)
 	if w.hwnd == 0 {
 		return nil, errors.New("mygo: cannot create a window")
 	}
 	b.windows[w.hwnd] = w
-	w.placeInitially()
+	if o.Flyout != nil {
+		if o.HasShadow {
+			w.roundFlyout()
+		}
+		w.PlaceFlyout(*o.Flyout, platform.Size{Width: o.Width, Height: o.Height})
+	} else {
+		w.placeInitially()
+	}
 
 	if !o.Closable {
 		w.SetClosable(false)
@@ -115,7 +166,7 @@ func (b *Backend) NewWindow(o *platform.WindowOptions, h platform.WindowHandler)
 	if o.BackgroundColor != nil {
 		w.SetBackgroundColor(*o.BackgroundColor)
 	}
-	if w.captionless() && w.shadow {
+	if w.captionless() && w.shadow && o.Flyout == nil {
 		w.SetHasShadow(true)
 	}
 	if w.hiddenTitleBar {
@@ -134,7 +185,7 @@ func (b *Backend) NewWindow(o *platform.WindowOptions, h platform.WindowHandler)
 	if b.icon != 0 {
 		w.setIcon(b.icon)
 	}
-	if b.appMenu != nil {
+	if b.appMenu != nil && o.Flyout == nil {
 		w.installMenu(b.appMenu)
 	}
 	if o.Modal && w.parent != nil {
@@ -170,6 +221,9 @@ func (w *window) styles() (style, ex uint32) {
 	if !o.Focusable {
 		ex |= wsExNoActivate
 	}
+	if w.noRedirect {
+		ex |= wsExNoRedirect
+	}
 	return style, ex
 }
 
@@ -201,7 +255,7 @@ func (w *window) placeInitially() {
 func (w *window) outerSize(width, height int32, dpi int) (int32, int32) {
 	r := rect{0, 0, width, height}
 	menu := uintptr(0)
-	if !w.autoHideMenu && (w.hmenu != 0 || w.b.appMenu != nil) {
+	if !w.autoHideMenu && !w.noRedirect && (w.hmenu != 0 || w.b.appMenu != nil) {
 		menu = 1
 	}
 	style, ex := windowLong(w.hwnd, gwlStyle), windowLong(w.hwnd, gwlExStyle)
@@ -247,6 +301,14 @@ func (w *window) message(m uint32, wp, lp uintptr) (uintptr, bool) {
 		w.applyTaskbar()
 		return 0, true
 	}
+	if w.opts.Flyout != nil {
+		if r, ok := w.flyoutMessage(m, wp, lp); ok {
+			return r, true
+		}
+	}
+	if m == wmMouseActivate && w.ownsFocusableFlyout() {
+		return maActivateAndEat, true
+	}
 	switch m {
 	case wmClose:
 		if w.h.ShouldClose() {
@@ -257,6 +319,13 @@ func (w *window) message(m uint32, wp, lp uintptr) (uintptr, bool) {
 		w.cleanup()
 		w.h.Closed()
 		return 0, true
+	case wmTimer:
+		if wp != timerWebView {
+			return 0, false
+		}
+		procKillTimer.Call(w.hwnd, timerWebView)
+		w.createWebView()
+		return 0, true
 	case wmSize:
 		if !w.reframing { // SetFullScreen lays the window out once it is done
 			w.sized(wp)
@@ -265,6 +334,11 @@ func (w *window) message(m uint32, wp, lp uintptr) (uintptr, bool) {
 	case wmMove:
 		if w.controller != 0 {
 			comCall(w.controller, ctlNotifyParentWindowPositionChanged)
+		}
+		for _, v := range w.webViews {
+			if v.controller != 0 {
+				comCall(v.controller, ctlNotifyParentWindowPositionChanged)
+			}
 		}
 		w.h.Moved()
 		return 0, true
@@ -404,7 +478,16 @@ func (w *window) captionless() bool { return w.frameless || w.hiddenTitleBar }
 func (w *window) frameCalcSize(wp, lp uintptr) uintptr {
 	params := (*ncCalcSizeParams)(native(lp))
 	if w.IsMaximized() {
-		params.Rgrc[0] = monitorWorkArea(w.monitor())
+		// The monitor of the proposed rectangle, not of the window: while a
+		// window is restored from minimized it is still the minimized one,
+		// parked off screen, whose nearest monitor is not the one it comes
+		// back to. Fitting the work area of the wrong monitor leaves the
+		// client area outside the window, and the content shows nothing.
+		// A rectangle on no monitor keeps the whole window as its client
+		// area, as winit and tao do.
+		if mon, _, _ := procMonitorFromRect.Call(uintptr(unsafe.Pointer(&params.Rgrc[0])), monitorDefaultToNull); mon != 0 {
+			params.Rgrc[0] = monitorWorkArea(mon)
+		}
 		return 0
 	}
 	if windowLong(w.hwnd, gwlStyle)&wsThickFrame != 0 {
@@ -434,6 +517,7 @@ func (w *window) cleanup() {
 	if w.closed {
 		return
 	}
+	w.closeWebViews()
 	w.closed = true
 	if w.opts.Modal && w.parent != nil && !w.parent.closed {
 		procEnableWindow.Call(w.parent.hwnd, 1)
@@ -442,7 +526,7 @@ func (w *window) cleanup() {
 		delete(w.calls, id)
 		cb("", errDestroyed)
 	}
-	w.pending = nil
+	w.failPending(errDestroyed)
 	if w.caption != nil {
 		w.caption.forget()
 	}
@@ -615,6 +699,10 @@ func (w *window) SetAlwaysOnTop(v bool) {
 func (w *window) IsAlwaysOnTop() bool { return windowLong(w.hwnd, gwlExStyle)&wsExTopmost != 0 }
 
 func (w *window) Show() {
+	if f := w.opts.Flyout; f != nil && !f.Focusable {
+		procShowWindow.Call(w.hwnd, swShowNoActivate)
+		return
+	}
 	if w.showMaximized {
 		w.showMaximized = false
 		procShowWindow.Call(w.hwnd, swShowMaximized)
@@ -641,6 +729,14 @@ func (w *window) IsVisible() bool {
 }
 
 func (w *window) Focus() {
+	if w.host != nil {
+		w.focusWebView()
+		return
+	}
+	if f := w.opts.Flyout; f != nil && !f.Focusable {
+		w.Show() // never activated
+		return
+	}
 	if w.IsMinimized() {
 		procShowWindow.Call(w.hwnd, swRestore)
 	}
@@ -657,6 +753,9 @@ func (w *window) Blur() {
 }
 
 func (w *window) IsFocused() bool {
+	if w.host != nil {
+		return w.focused
+	}
 	fg, _, _ := procGetForegroundWindow.Call()
 	return fg == w.hwnd
 }
@@ -755,17 +854,25 @@ func (w *window) Center() {
 
 func (w *window) SetBackgroundColor(c platform.Color) {
 	w.bg = &c
-	if w.bgBrush != 0 {
-		procDeleteObject.Call(w.bgBrush)
+	// A web view in native UI has no window of its own to paint: only
+	// WebView2 fills it, and a brush would outlive it.
+	if w.host == nil {
+		if w.bgBrush != 0 {
+			procDeleteObject.Call(w.bgBrush)
+		}
+		w.bgBrush, _, _ = procCreateSolidBrush.Call(uintptr(c.R) | uintptr(c.G)<<8 | uintptr(c.B)<<16)
 	}
-	w.bgBrush, _, _ = procCreateSolidBrush.Call(uintptr(c.R) | uintptr(c.G)<<8 | uintptr(c.B)<<16)
 	w.withWebView(w.applyWebViewBackground)
-	procInvalidateRect(w.hwnd)
+	if w.hwnd != 0 {
+		procInvalidateRect(w.hwnd)
+	}
 }
 
 // applyWebViewBackground paints the webview before its page does:
 // transparent with a material behind it, else the background color.
 // WebView2 only supports fully opaque or fully transparent backgrounds.
+// A transparent page shows the window's background color behind it, which
+// GDI paints; in a window without a redirection bitmap, the webview does.
 func (w *window) applyWebViewBackground() {
 	ctl2 := queryInterface(w.controller, &iidICoreWebView2Controller2)
 	if ctl2 == 0 {
@@ -774,7 +881,9 @@ func (w *window) applyWebViewBackground() {
 	defer release(ctl2)
 	var c uint32 = 0xFFFFFFFF // opaque white: A, R, G, B bytes
 	switch {
-	case w.vibrancy != "" || w.opts.Transparent:
+	case w.vibrancy != "":
+		c = 0
+	case w.opts.Transparent && (w.bg == nil || !w.noRedirect):
 		c = 0
 	case w.bg != nil && w.bg.A == 0:
 		c = 0
@@ -902,6 +1011,10 @@ func (w *window) TitleBarDoubleClicked() {
 }
 
 func (w *window) Close() {
+	if w.host != nil {
+		w.closeWebView()
+		return
+	}
 	if !w.closed {
 		w.destroy()
 	}

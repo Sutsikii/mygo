@@ -5,11 +5,13 @@ import (
 	"image/png"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/egoist/mygo/plugins/terminal/internal/vt"
 	"github.com/egoist/mygo/ui"
 	"golang.org/x/image/font/gofont/gomono"
 	"golang.org/x/image/font/gofont/gomonobold"
@@ -199,6 +201,51 @@ func TestScrollback(t *testing.T) {
 	tt.Type("x")
 	if got := offset(); got != bottom {
 		t.Errorf("after typing, offset = %d, want %d", got, bottom)
+	}
+}
+
+// A snapshot of a terminal no view shows restores what it shows in
+// another, as a server keeping sessions sends it to a window attaching.
+func TestSnapshot(t *testing.T) {
+	loadLib(t)
+	newTerm := func() *Terminal {
+		term, err := New(Options{Conn: newPipe()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { term.Close() })
+		term.Resize(40, 6)
+		return term
+	}
+	a := newTerm()
+	for i := range 10 {
+		a.Feed([]byte("line " + itoa(i) + " \x1b[31mred\x1b[0m \x1b[1;4mbold\x1b[0m\r\n"))
+	}
+	a.Feed([]byte("prompt % \x1b[?2004h"))
+	snap := a.Snapshot()
+	b := newTerm()
+	b.Feed(snap)
+	// The cursor and the modes come too: what follows lands alike.
+	a.Feed([]byte("x"))
+	b.Feed([]byte("x"))
+	if a.Text() != b.Text() {
+		t.Errorf("restored text\n%q, want\n%q", b.Text(), a.Text())
+	}
+	b.mu.Lock()
+	paste := b.term.Mode(vt.ModeBracketedPaste)
+	b.mu.Unlock()
+	if !paste {
+		t.Error("bracketed paste was not restored")
+	}
+	// A full-screen program's screen, at a new size.
+	a.Feed([]byte("\x1b[?1049h\x1b[H\x1b[2Jfull screen\x1b[3;5Hhere"))
+	a.Resize(30, 5)
+	c := newTerm()
+	c.Resize(30, 5)
+	c.Feed(a.Snapshot())
+	c.Feed([]byte("!"))
+	if got := c.Text(); !strings.Contains(got, "full screen") || !strings.Contains(got, "here!") {
+		t.Errorf("restored alternate screen %q", got)
 	}
 }
 
@@ -663,5 +710,215 @@ func TestCloseKillsWhatIgnoresHangups(t *testing.T) {
 	case <-term.Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("Done was not closed: the program outlived Close")
+	}
+}
+
+// TestCommandClickLinks: Command+click hands URLs and printed paths to
+// Options.OpenLink, and URLs it leaves to the system.
+func TestCommandClickLinks(t *testing.T) {
+	loadLib(t)
+	var opened []string
+	term, err := New(Options{Conn: newPipe(), OpenLink: func(link string) bool {
+		opened = append(opened, link)
+		return link != "https://x.org"
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer term.Close()
+	term.Feed([]byte("see src/app.go:12 or https://x.org\r\nplain words"))
+	tt := ui.NewTester(func(c *ui.Context) { View(c, term).Fill().AutoFocus() }, 400, 200)
+	tt.Frame()
+	for _, col := range []int{6, 24} {
+		x, y := cellCenter(term, col, 0)
+		tt.ClickAtWith(ui.Cmd, x, y)
+	}
+	x, y := cellCenter(term, 2, 1)
+	tt.ClickAtWith(ui.Cmd, x, y)
+	if want := []string{"src/app.go:12", "https://x.org"}; !slices.Equal(opened, want) {
+		t.Errorf("opened %q, want %q", opened, want)
+	}
+	if u := tt.OpenedURLs(); !slices.Equal(u, []string{"https://x.org"}) {
+		t.Errorf("system opened %q", u)
+	}
+}
+
+// TestCommandClickLinkWithoutOpenLink: without Options.OpenLink, the system
+// opens hyperlinks of any scheme, paths are no links, the pointer is a hand
+// over a link while Command is held, and a click on a link goes before a
+// program that takes the mouse, its release too.
+func TestCommandClickLinkWithoutOpenLink(t *testing.T) {
+	loadLib(t)
+	conn := newPipe()
+	term, err := New(Options{Conn: conn})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer term.Close()
+	term.Feed([]byte("\x1b]8;;vscode://file/a.go\x1b\\edit\x1b]8;;\x1b\\ src/app.go:12"))
+	tt := ui.NewTester(func(c *ui.Context) { View(c, term).Fill().AutoFocus() }, 400, 200)
+	tt.Frame()
+	x, y := cellCenter(term, 1, 0)
+	tt.Move(x, y)
+	if c := tt.Cursor(); c != ui.CursorText {
+		t.Errorf("the cursor is %v over a link without Command", c)
+	}
+	// Command pressed and let go of with the pointer still.
+	tt.HoldModifiers(ui.Cmd)
+	if c := tt.Cursor(); c != ui.CursorPointer {
+		t.Errorf("the cursor is %v over a link with Command", c)
+	}
+	tt.HoldModifiers(0)
+	if c := tt.Cursor(); c != ui.CursorText {
+		t.Errorf("the cursor is %v once Command is let go of", c)
+	}
+	term.Feed([]byte("\x1b[?1002h\x1b[?1006h"))
+	tt.Frame()
+	tt.ClickAtWith(ui.Cmd, x, y)
+	x2, y2 := cellCenter(term, 8, 0)
+	tt.ClickAtWith(ui.Cmd, x2, y2)
+	if u := tt.OpenedURLs(); !slices.Equal(u, []string{"vscode://file/a.go"}) {
+		t.Errorf("system opened %q", u)
+	}
+	// The click on the path, no link without OpenLink, went to the
+	// program; the one on the link did not, nor its release.
+	got := conn.take(18) // two reports, 22 bytes with Control
+	if strings.Count(got, "\x1b[<") != 2 || strings.Count(got, ";9;1M") != 1 || strings.Count(got, ";9;1m") != 1 {
+		t.Errorf("sent %q, want the press and the release of the path's click", got)
+	}
+}
+
+// TestOnPasteTakesAPaste: Options.OnPaste sees a paste and the clipboard's
+// text, and a true result pastes nothing.
+func TestOnPasteTakesAPaste(t *testing.T) {
+	loadLib(t)
+	conn := newPipe()
+	var seen []string
+	take := true
+	term, err := New(Options{Conn: conn, OnPaste: func(text string) bool { seen = append(seen, text); return take }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer term.Close()
+	tt := ui.NewTester(func(c *ui.Context) { View(c, term).Fill().AutoFocus() }, 400, 200)
+	tt.SetClipboard("hello")
+	tt.Frame()
+	paste := ui.Super
+	if runtime.GOOS != "darwin" {
+		paste = ui.Ctrl | ui.Shift
+	}
+	tt.Key(paste, ui.KeyV)
+	tt.Command("paste") // the Edit menu's Paste
+	tt.Frame()
+	if !slices.Equal(seen, []string{"hello", "hello"}) {
+		t.Fatalf("OnPaste saw %q", seen)
+	}
+	if got := conn.take(1); len(got) != 0 {
+		t.Errorf("a taken paste sent %q", got)
+	}
+	take = false
+	tt.Key(paste, ui.KeyV)
+	tt.Frame()
+	if got := conn.take(5); got != "hello" || len(seen) != 3 {
+		t.Errorf("a paste OnPaste leaves sent %q (seen %q)", got, seen)
+	}
+}
+
+// TestOnKeyTakesAKey: Options.OnKey sees a key press before the terminal
+// encodes it, in order with the keys after it; a true result sends
+// nothing, not even the text the key types.
+func TestOnKeyTakesAKey(t *testing.T) {
+	loadLib(t)
+	conn := newPipe()
+	var seen []ui.Key
+	var term *Terminal
+	term, err := New(Options{Conn: conn, OnKey: func(mods ui.Modifiers, key ui.Key) bool {
+		seen = append(seen, key)
+		if mods == ui.Ctrl && key == ui.KeyV || key == ui.KeyX {
+			term.Send([]byte("<taken>")) // in order with what is typed
+			return true
+		}
+		return false
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer term.Close()
+	tt := ui.NewTester(func(c *ui.Context) { View(c, term).Fill().AutoFocus() }, 400, 200)
+	tt.Frame()
+	tt.Key(ui.Ctrl, ui.KeyV)
+	tt.Key(0, ui.KeyTab)
+	tt.TypeKey(0, ui.KeyX, "x")
+	tt.TypeKey(0, ui.KeyY, "y")
+	tt.Frame()
+	if got := conn.take(16); got != "<taken>\t<taken>y" {
+		t.Errorf("sent %q, want the taken keys' marks in order with Tab and y", got)
+	}
+	if !slices.Equal(seen, []ui.Key{ui.KeyV, ui.KeyTab, ui.KeyX, ui.KeyY}) {
+		t.Errorf("OnKey saw %v", seen)
+	}
+}
+
+// TestOnScrollTakesTheWheel: Options.OnScroll sees the wheel's whole rows
+// before the scrollback moves, unless a program takes the wheel: as the
+// mouse, or as the arrows of a full-screen program.
+func TestOnScrollTakesTheWheel(t *testing.T) {
+	loadLib(t)
+	conn := newPipe()
+	var seen []int
+	term, err := New(Options{Conn: conn, OnScroll: func(rows int) bool {
+		seen = append(seen, rows)
+		return true
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer term.Close()
+	tt := ui.NewTester(func(c *ui.Context) { View(c, term).Fill().AutoFocus() }, 400, 200)
+	var b strings.Builder
+	for i := range 100 {
+		b.WriteString("line " + itoa(i) + "\r\n")
+	}
+	term.Feed([]byte(b.String()))
+	tt.Frame()
+	offset := func() uint64 {
+		term.mu.Lock()
+		defer term.mu.Unlock()
+		return term.term.Scrollbar().Offset
+	}
+	bottom := offset()
+	tt.Scroll(100, 100, 0, -40) // a notch up
+	tt.Scroll(100, 100, 0, 40)  // and down
+	if !slices.Equal(seen, []int{-3, 3}) {
+		t.Errorf("OnScroll saw %v, want [-3 3]", seen)
+	}
+	if got := offset(); got != bottom {
+		t.Errorf("a taken scroll moved the scrollback: offset = %d, want %d", got, bottom)
+	}
+	// The program takes the mouse: the wheel goes to it.
+	term.Feed([]byte("\x1b[?1002h\x1b[?1006h"))
+	tt.Frame()
+	tt.Scroll(100, 100, 0, -40)
+	if len(seen) != 2 {
+		t.Errorf("OnScroll saw %v while the program took the mouse", seen)
+	}
+	if got := conn.take(10); !strings.HasPrefix(got, "\x1b[<64;") {
+		t.Errorf("wheel sent %q, want a mouse report", got)
+	}
+	// A full-screen program gets it as arrows, unless it turns that off.
+	term.Feed([]byte("\x1b[?1002l\x1b[?1006l\x1b[?1049h"))
+	tt.Frame()
+	tt.Scroll(100, 100, 0, -40)
+	if len(seen) != 2 {
+		t.Errorf("OnScroll saw %v on a full-screen program's screen", seen)
+	}
+	if got := conn.take(9); strings.Count(got, "A") != 3 {
+		t.Errorf("wheel sent %q, want three arrows up", got)
+	}
+	term.Feed([]byte("\x1b[?1007l"))
+	tt.Frame()
+	tt.Scroll(100, 100, 0, -40)
+	if !slices.Equal(seen, []int{-3, 3, -3}) {
+		t.Errorf("OnScroll saw %v without alternate scroll", seen)
 	}
 }

@@ -3,7 +3,6 @@
 package darwin
 
 import (
-	"runtime"
 	"strings"
 	"unsafe"
 
@@ -36,8 +35,11 @@ type Backend struct {
 	hotkeys     map[int]uintptr
 	hkInstalled bool
 
-	notifyDelegate   id
-	notifyAuthorized bool
+	notifyDelegate id
+	// notifyAnswered records that the user has answered whether the app
+	// may show notifications; notifyWaiting holds those shown meanwhile.
+	notifyAnswered bool
+	notifyWaiting  []waitingNotification
 
 	stepping       int
 	quitAfterModal bool
@@ -104,6 +106,7 @@ func (b *Backend) Init(h platform.AppHandler, opts platform.AppOptions) error {
 	b.delegate = alloc("MyGoAppDelegate")
 	send(b.app, "setDelegate:", uintptr(b.delegate))
 	b.menuTarget = alloc("MyGoMenuTarget")
+	b.attachNotificationDelegate()
 
 	// A run loop source drives the queue of functions posted from other
 	// goroutines. It fires in every run loop mode, including while menus
@@ -119,6 +122,11 @@ func (b *Backend) Init(h platform.AppHandler, opts platform.AppOptions) error {
 	center := send(class("NSNotificationCenter"), "defaultCenter")
 	send(center, "addObserver:selector:name:object:", uintptr(b.delegate), uintptr(sel("screensChanged:")),
 		uintptr(nsString("NSApplicationDidChangeScreenParametersNotification")), 0)
+	// The accent color, and the display settings of accessibility.
+	send(center, "addObserver:selector:name:object:", uintptr(b.delegate), uintptr(sel("preferencesChanged:")),
+		uintptr(nsString("NSSystemColorsDidChangeNotification")), 0)
+	send(send(workspace(), "notificationCenter"), "addObserver:selector:name:object:", uintptr(b.delegate), uintptr(sel("preferencesChanged:")),
+		uintptr(nsString("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification")), 0)
 	return nil
 }
 
@@ -185,15 +193,11 @@ func (b *Backend) Step() {
 	})
 }
 
-// Wake makes a pending Step return. It is called from any goroutine: the
-// autorelease pool of postEvent belongs to one thread, so the goroutine
-// must not move to another one meanwhile.
+// Wake makes a pending Step return. It is called from any goroutine.
 func (b *Backend) Wake() {
 	if b.app == 0 {
 		return
 	}
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	b.postEvent(wakeSubtype)
 }
 
@@ -215,6 +219,7 @@ func registerClasses() {
 	registerAppDelegate()
 	registerWindowClasses()
 	registerSurfaceClass()
+	registerClipboardClass()
 	registerAccessClass()
 	registerMenuTarget()
 	registerSchemeHandler()
@@ -234,6 +239,16 @@ const (
 
 func registerAppDelegate() {
 	classDef("MyGoAppDelegate", "NSObject", []string{"NSApplicationDelegate"}, []objc.MethodDef{
+		// The end of a PrintToPDF job (printJobs). WebKit's print operations
+		// may finish on a background thread.
+		method("mygoPrintOperationDidRun:success:contextInfo:", func(self id, _ objc.SEL, op id, success bool, job uintptr) {
+			theBackend.runOnMain(func() {
+				if j := printJobs[job]; j != nil {
+					delete(printJobs, job)
+					j.done(success)
+				}
+			})
+		}),
 		method("applicationWillFinishLaunching:", func(self id, _ objc.SEL, n id) {
 			// Handle the quit Apple Event (Dock > Quit, AppleScript, logout)
 			// ourselves so the sender gets a proper reply while Run still
@@ -317,13 +332,14 @@ func registerAppDelegate() {
 		method("applicationShouldTerminateAfterLastWindowClosed:", func(self id, _ objc.SEL, app id) bool { return false }),
 		method("observeValueForKeyPath:ofObject:change:context:", func(self id, _ objc.SEL, keyPath, object, change id, ctx uintptr) {
 			if goString(keyPath) == "effectiveAppearance" {
-				// AppKit lays the title bars out again after telling us.
-				theBackend.post(theBackend.layoutTrafficLights)
 				theBackend.h.ThemeChanged()
 			}
 		}),
 		method("screensChanged:", func(self id, _ objc.SEL, n id) {
 			theBackend.h.DisplaysChanged()
+		}),
+		method("preferencesChanged:", func(self id, _ objc.SEL, n id) {
+			theBackend.h.ThemeChanged()
 		}),
 	})
 }

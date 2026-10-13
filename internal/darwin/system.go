@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/egoist/mygo/internal/platform"
+	"github.com/egoist/mygo/transfer"
 )
 
 // Clipboard (NSPasteboard).
@@ -30,13 +31,7 @@ func (clipboard) ReadText() string {
 	return s
 }
 
-func (clipboard) WriteText(text string) {
-	withPool(func() {
-		pb := pasteboard()
-		send(pb, "clearContents")
-		send(pb, "setString:forType:", uintptr(nsString(text)), uintptr(nsString(utString)))
-	})
-}
+func (c clipboard) WriteText(text string) { _ = c.WriteData(transfer.TextData(text), nil) }
 
 func (clipboard) ReadHTML() string {
 	var s string
@@ -44,12 +39,8 @@ func (clipboard) ReadHTML() string {
 	return s
 }
 
-func (clipboard) WriteHTML(markup string) {
-	withPool(func() {
-		pb := pasteboard()
-		send(pb, "clearContents")
-		send(pb, "setString:forType:", uintptr(nsString(markup)), uintptr(nsString(utHTML)))
-	})
+func (c clipboard) WriteHTML(markup string) {
+	_ = c.WriteData(transfer.New(transfer.NewItem(transfer.Bytes(transfer.HTML, []byte(markup)), transfer.Bytes(transfer.Text, []byte(markup)))), nil)
 }
 
 func (clipboard) ReadImage() []byte {
@@ -70,22 +61,27 @@ func (clipboard) ReadImage() []byte {
 	return out
 }
 
-func (clipboard) WriteImage(png []byte) error {
+func (c clipboard) WriteImage(png []byte) error {
 	var err error
 	withPool(func() {
 		img := autorelease(send(send(class("NSImage"), "alloc"), "initWithData:", uintptr(nsData(png))))
 		if img == 0 {
 			err = errInvalidImage
-			return
 		}
-		pb := pasteboard()
-		send(pb, "clearContents")
-		send(pb, "setData:forType:", uintptr(nsData(png)), uintptr(nsString(utPNG)))
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	return c.WriteData(transfer.New(transfer.NewItem(transfer.Bytes(transfer.PNG, png))), nil)
 }
-
-func (clipboard) Clear() { send(pasteboard(), "clearContents") }
+func (clipboard) Clear() {
+	withPool(func() {
+		send(pasteboard(), "clearContents")
+		if s := macClipboard; s != nil {
+			s.release()
+		}
+	})
+}
 
 func (clipboard) AvailableFormats() []string {
 	var out []string
@@ -197,6 +193,33 @@ type theme struct{ b *Backend }
 func (theme) UIFont() string { return "" }
 
 func (theme) FontRendering() platform.FontRendering { return platform.FontRendering{} }
+
+// Preferences reads the accent color and the display settings of
+// accessibility.
+func (t theme) Preferences() platform.Preferences {
+	var p platform.Preferences
+	withPool(func() {
+		ws := workspace()
+		p.ReduceMotion = sendBool(ws, "accessibilityDisplayShouldReduceMotion")
+		p.HighContrast = sendBool(ws, "accessibilityDisplayShouldIncreaseContrast")
+		// The accent, as the app's appearance draws it.
+		var c id
+		appearance := class("NSAppearance")
+		prev := send(appearance, "currentAppearance")
+		send(appearance, "setCurrentAppearance:", uintptr(send(t.b.app, "effectiveAppearance")))
+		if accent := send(class("NSColor"), "controlAccentColor"); accent != 0 {
+			c = send(accent, "colorUsingColorSpace:", uintptr(send(class("NSColorSpace"), "sRGBColorSpace")))
+		}
+		send(appearance, "setCurrentAppearance:", uintptr(prev))
+		if c != 0 {
+			var r, g, b, a float64
+			send(c, "getRed:green:blue:alpha:", uintptr(unsafe.Pointer(&r)), uintptr(unsafe.Pointer(&g)), uintptr(unsafe.Pointer(&b)), uintptr(unsafe.Pointer(&a)))
+			byteOf := func(v float64) uint8 { return uint8(max(0, min(v, 1))*255 + 0.5) }
+			p.Accent = platform.Color{R: byteOf(r), G: byteOf(g), B: byteOf(b), A: 255}
+		}
+	})
+	return p
+}
 
 func (t theme) IsDark() bool {
 	var dark bool

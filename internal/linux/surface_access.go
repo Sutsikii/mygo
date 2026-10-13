@@ -5,6 +5,7 @@ package linux
 import (
 	"math"
 	"slices"
+	"strconv"
 	"sync"
 	"unicode"
 	"unicode/utf8"
@@ -20,7 +21,11 @@ import (
 // GtkDrawingArea whose accessible, a subclass of GtkWidgetAccessible, has
 // the nodes of the content's tree below it: ATK objects of types
 // registered here, which answer from the last tree and turn what assistive
-// technology does into AccessAction events.
+// technology does into AccessAction events. The page of a web view is
+// inside the node standing for it: the node's child is the web view's
+// accessible, an AtkSocket the web process's tree is embedded in, which
+// the overlay holding the web views and the surface (a subclass) does not
+// list beside the content.
 //
 // Registering types writes functions into ATK's class and interface
 // structures at offsets of its headers. The class's size is checked
@@ -33,7 +38,8 @@ var (
 
 	// The types: the drawing area, its accessible, and the nodes', by
 	// the interfaces they implement.
-	areaType, glAreaType, rootType, nodeType, rangeType, textType, editableType uintptr
+	areaType, glAreaType, rootType, nodeType, rangeType, textType, editableType, selectionType uintptr
+	overlayType, overlayAccessType                                                             uintptr
 
 	gTypeRegisterStaticSimple func(parent uintptr, name *byte, classSize uint32, classInit ptr, instanceSize uint32, instanceInit ptr, flags uint32) uintptr
 	gTypeAddInterfaceStatic   func(instanceType, ifaceType uintptr, info *gInterfaceInfo)
@@ -49,6 +55,11 @@ var (
 	gSignalEmitInt            func(obj ptr, signal *byte, v int32)
 	gSignalEmit               func(obj ptr, signal *byte)
 	gObjectNotify             func(obj ptr, property *byte)
+	// gSignalEmitAnnouncement emits AtkObject's announcement signal, which
+	// ATK has had since 2.46: announces is set where it has.
+	gSignalLookup           func(name *byte, t uintptr) uint32
+	gSignalEmitAnnouncement func(obj ptr, signal *byte, text *byte)
+	announces               bool
 
 	gtkWidgetAccessibleGetType      func() uintptr
 	gtkDrawingAreaGetType           func() uintptr
@@ -57,12 +68,16 @@ var (
 	gtkWidgetClassSetAccessibleRole func(class ptr, role int32)
 	gtkAccessibleGetWidget          func(accessible ptr) ptr
 	gtkWidgetGetAccessible          func(widget ptr) ptr
+	gtkOverlayGetType               func() uintptr
+	gtkContainerAccessibleGetType   func() uintptr
+	atkSocketGetType                func() uintptr
 
 	atkGetMajorVersion, atkGetMinorVersion                  func() uint32
 	atkObjectGetType, atkComponentGetType, atkActionGetType func() uintptr
 	atkValueGetType, atkTextGetType, atkEditableTextGetType func() uintptr
+	atkSelectionGetType                                     func() uintptr
 	atkRoleForName, atkStateTypeForName                     func(name *byte) int32
-	atkObjectSetName                                        func(obj ptr, name *byte)
+	atkObjectSetName, atkObjectSetDescription               func(obj ptr, name *byte)
 	atkObjectSetRole                                        func(obj ptr, role int32)
 	atkObjectSetParent                                      func(obj, parent ptr)
 	atkObjectNotifyStateChange                              func(obj ptr, state uint64, value bool)
@@ -73,13 +88,17 @@ var (
 
 	cbAreaClassInit, cbRootClassInit, cbNodeClassInit, cbRootComponent     ptr
 	cbComponentInit, cbActionInit, cbValueInit, cbTextInit, cbEditableInit ptr
+	cbSelectionInit, cbOverlayClassInit, cbOverlayAccessClassInit          ptr
+
+	// rootParentIndex is GtkWidgetAccessible's get_index_in_parent.
+	rootParentIndex ptr
 
 	atkRoles  = map[platform.AccessRole]int32{}
-	atkRole   struct{ panel, text, password int32 }
+	atkRole   struct{ panel, text, password, listBox int32 }
 	atkStates struct {
 		enabled, sensitive, visible, showing, focusable, focused, checkable, checked, indeterminate,
 		expandable, expanded, editable, readOnly, multiLine, singleLine, selectableText, defunct int32
-		selectable, selected int32
+		selectable, selected, multiselectable, hasPopup, invalidEntry, vertical, horizontal int32
 	}
 
 	// The trees of surfaces, by the surface and by its accessible, and the
@@ -89,7 +108,7 @@ var (
 	accessObjects = map[ptr]*accessNode{}
 
 	// Static strings of actions.
-	clickName, emptyName = []byte("click\x00"), []byte("\x00")
+	clickName, expandName, emptyName = []byte("click\x00"), []byte("expand or contract\x00"), []byte("\x00")
 )
 
 // gTypeQueryInfo is GTypeQuery.
@@ -169,8 +188,10 @@ func registerAccess() {
 		{a, &atkObjectGetType, "atk_object_get_type"}, {a, &atkComponentGetType, "atk_component_get_type"},
 		{a, &atkActionGetType, "atk_action_get_type"}, {a, &atkValueGetType, "atk_value_get_type"},
 		{a, &atkTextGetType, "atk_text_get_type"}, {a, &atkEditableTextGetType, "atk_editable_text_get_type"},
+		{a, &atkSelectionGetType, "atk_selection_get_type"},
 		{a, &atkRoleForName, "atk_role_for_name"}, {a, &atkStateTypeForName, "atk_state_type_for_name"},
 		{a, &atkObjectSetName, "atk_object_set_name"}, {a, &atkObjectSetRole, "atk_object_set_role"},
+		{a, &atkObjectSetDescription, "atk_object_set_description"},
 		{a, &atkObjectSetParent, "atk_object_set_parent"}, {a, &atkObjectNotifyStateChange, "atk_object_notify_state_change"},
 		{a, &atkStateSetNew, "atk_state_set_new"}, {a, &atkStateSetAddState, "atk_state_set_add_state"},
 		{a, &atkRangeNew, "atk_range_new"}, {a, &atkComponentGetExtents, "atk_component_get_extents"},
@@ -187,6 +208,8 @@ func registerAccess() {
 	}
 	loadAccessNames()
 	initAccessCallbacks()
+	announces = bind(o, &gSignalLookup, "g_signal_lookup") && bind(o, &gSignalEmitAnnouncement, "g_signal_emit_by_name") &&
+		gSignalLookup(cs("announcement"), atkObjectGetType()) != 0
 	register := func(parent uintptr, name string, classInit ptr) uintptr {
 		var q gTypeQueryInfo
 		gTypeQuery(parent, &q)
@@ -203,7 +226,8 @@ func registerAccess() {
 	rangeType = register(nodeType, "MyGoAccessibleRange", 0)
 	textType = register(nodeType, "MyGoAccessibleText", 0)
 	editableType = register(textType, "MyGoAccessibleEditable", 0)
-	if rangeType == 0 || textType == 0 || editableType == 0 {
+	selectionType = register(nodeType, "MyGoAccessibleSelection", 0)
+	if rangeType == 0 || textType == 0 || editableType == 0 || selectionType == 0 {
 		return
 	}
 	implement(rootType, atkComponentGetType(), cbRootComponent)
@@ -212,11 +236,51 @@ func registerAccess() {
 	implement(rangeType, atkValueGetType(), cbValueInit)
 	implement(textType, atkTextGetType(), cbTextInit)
 	implement(editableType, atkEditableTextGetType(), cbEditableInit)
+	implement(selectionType, atkSelectionGetType(), cbSelectionInit)
 	areaType = register(gtkDrawingAreaGetType(), "MyGoSurfaceArea", cbAreaClassInit)
 	// GtkGLArea came in GTK 3.16.
 	if bind(t, &gtkGLAreaGetType, "gtk_gl_area_get_type") {
 		glAreaType = register(gtkGLAreaGetType(), "MyGoSurfaceGLArea", cbAreaClassInit)
 	}
+	// The overlay holding web views lists the surface alone, whose nodes
+	// hold the pages.
+	if bind(t, &gtkOverlayGetType, "gtk_overlay_get_type") && bind(t, &gtkContainerAccessibleGetType, "gtk_container_accessible_get_type") &&
+		bind(a, &atkSocketGetType, "atk_socket_get_type") {
+		if overlayAccessType = register(gtkContainerAccessibleGetType(), "MyGoSurfaceOverlayAccessible", cbOverlayAccessClassInit); overlayAccessType != 0 {
+			overlayType = register(gtkOverlayGetType(), "MyGoSurfaceOverlay", cbOverlayClassInit)
+		}
+	}
+}
+
+// newOverlay creates the overlay putting a surface's area over its web
+// views.
+func newOverlay() ptr {
+	if overlayType != 0 {
+		return gObjectNew(overlayType, 0)
+	}
+	return gtkOverlayNew()
+}
+
+// layersOf returns the surface whose web views the overlay holds.
+func layersOf(overlay ptr) *surface {
+	for _, s := range surfaceAreas {
+		if s.layers == overlay && overlay != 0 {
+			return s
+		}
+	}
+	return nil
+}
+
+// pageAccessible returns the accessible of a web view, the AtkSocket its
+// page's tree is embedded in, or 0.
+func (w *window) pageAccessible() ptr {
+	if atkSocketGetType == nil || w.web == 0 {
+		return 0
+	}
+	if acc := gtkWidgetGetAccessible(w.web); acc != 0 && gTypeCheckInstanceIsA(acc, atkSocketGetType()) {
+		return acc
+	}
+	return 0
 }
 
 // loadAccessNames finds ATK's roles and states by name, which, unlike
@@ -231,6 +295,7 @@ func loadAccessNames() {
 		return 0
 	}
 	atkRole.panel, atkRole.text, atkRole.password = role("panel"), role("text"), role("password text")
+	atkRole.listBox = role("list box")
 	for r, names := range map[platform.AccessRole][]string{
 		platform.RoleGroup: {"panel"}, platform.RoleText: {"label"}, platform.RoleButton: {"push button", "button"},
 		platform.RoleLink: {"link"}, platform.RoleCheckBox: {"check box"}, platform.RoleRadio: {"radio button"},
@@ -242,6 +307,14 @@ func loadAccessNames() {
 		platform.RoleStatus: {"notification", "status bar"}, platform.RoleTable: {"table"}, platform.RoleRow: {"table row"},
 		platform.RoleCell: {"table cell"}, platform.RoleColumnHeader: {"column header", "table column header"},
 		platform.RoleTree: {"tree", "tree table"}, platform.RoleTreeItem: {"tree item", "list item"},
+		platform.RoleListItem: {"list item"}, platform.RoleMenuButton: {"push button menu", "push button", "button"},
+		platform.RoleToolbar: {"tool bar"}, platform.RoleRadioGroup: {"panel"}, platform.RoleToggleButton: {"toggle button"},
+		platform.RoleComboBox: {"combo box"}, platform.RoleDisclosure: {"toggle button"},
+		platform.RoleMeter: {"level bar", "progress bar"}, platform.RoleStepper: {"spin button"},
+		platform.RoleColorWell: {"push button", "button"}, platform.RoleAlertDialog: {"alert", "dialog"},
+		platform.RoleMenu: {"menu"}, platform.RoleMenuBar: {"menu bar"}, platform.RoleMenuItem: {"menu item"},
+		platform.RoleMenuItemCheckBox: {"check menu item", "menu item"}, platform.RoleMenuItemRadio: {"radio menu item", "menu item"},
+		platform.RoleHeading: {"heading", "label"},
 	} {
 		atkRoles[r] = role(names...)
 	}
@@ -252,7 +325,8 @@ func loadAccessNames() {
 		&st.indeterminate: "indeterminate", &st.expandable: "expandable", &st.expanded: "expanded",
 		&st.editable: "editable", &st.readOnly: "read-only", &st.multiLine: "multi-line",
 		&st.singleLine: "single-line", &st.selectableText: "selectable-text", &st.defunct: "defunct",
-		&st.selectable: "selectable", &st.selected: "selected",
+		&st.selectable: "selectable", &st.selected: "selected", &st.multiselectable: "multiselectable",
+		&st.hasPopup: "has-popup", &st.invalidEntry: "invalid-entry", &st.vertical: "vertical", &st.horizontal: "horizontal",
 	} {
 		*p = atkStateTypeForName(cs(name))
 	}
@@ -276,6 +350,29 @@ type accessNode struct {
 	parent   *accessNode
 	children []*accessNode
 	n        platform.AccessNode
+	// chosen are the rows a list choosing its rows chose, among those
+	// built.
+	chosen []uint64
+	// page is the accessible of the web view's page the node stands for,
+	// its only child.
+	page ptr
+}
+
+// chooses reports whether a node is the row of a list, a table or an
+// outline that its list chooses.
+func chooses(n platform.AccessNode) bool {
+	return (n.Role == platform.RoleListItem || n.Role == platform.RoleRow || n.Role == platform.RoleTreeItem) && n.States&platform.AccessSelectable != 0
+}
+
+// chosenRows returns the rows of a list or table that are chosen.
+func (an *accessNode) chosenRows() []*accessNode {
+	var rows []*accessNode
+	for _, c := range an.children {
+		if chooses(c.n) && c.n.States&platform.AccessChecked != 0 {
+			rows = append(rows, c)
+		}
+	}
+	return rows
 }
 
 // rootTree returns the tree below a surface's accessible, asking the
@@ -313,6 +410,7 @@ func (s *surface) destroyAccess() {
 	}
 	delete(surfaceTrees, s)
 	delete(accessTrees, t.root)
+	t.graft(nil)
 	for _, an := range t.nodes {
 		an.release()
 	}
@@ -326,20 +424,27 @@ func (an *accessNode) release() {
 	gObjectUnref(an.obj)
 }
 
-func accessType(r platform.AccessRole) uintptr {
-	switch r {
-	case platform.RoleSlider, platform.RoleProgress:
+func accessType(n platform.AccessNode) uintptr {
+	switch n.Role {
+	case platform.RoleSlider, platform.RoleProgress, platform.RoleMeter, platform.RoleStepper:
 		return rangeType
-	case platform.RoleTextField:
+	case platform.RoleTextField, platform.RoleComboBox:
 		return editableType
 	case platform.RoleText:
 		return textType
+	case platform.RoleList, platform.RoleTable, platform.RoleTree:
+		if n.States&platform.AccessSelectable != 0 {
+			return selectionType // choosing its rows
+		}
 	}
 	return nodeType
 }
 
 func (an *accessNode) role() int32 {
 	r := atkRoles[an.n.Role]
+	if an.n.Role == platform.RoleList && an.n.States&platform.AccessSelectable != 0 && atkRole.listBox != 0 {
+		r = atkRole.listBox // choosing its items
+	}
 	if an.n.Role == platform.RoleTextField {
 		switch {
 		case an.n.States&platform.AccessPassword != 0:
@@ -363,7 +468,7 @@ func (t *accessTree) update(tree *platform.AccessTree) {
 	fresh := make([]bool, len(tree.Nodes))
 	oldKids := map[*accessNode][]*accessNode{nil: t.top}
 	for i, n := range tree.Nodes {
-		typ := accessType(n.Role)
+		typ := accessType(n)
 		an := old[n.ID]
 		if an != nil && an.typ == typ {
 			delete(old, n.ID)
@@ -392,11 +497,14 @@ func (t *accessTree) update(tree *platform.AccessTree) {
 			atkObjectSetParent(an.obj, parentObj)
 		}
 		an.parent = parent
-		if fresh[i] || prev[i].Role != an.n.Role || prev[i].States&(platform.AccessPassword|platform.AccessMultiline) != an.n.States&(platform.AccessPassword|platform.AccessMultiline) {
+		if roleStates := platform.AccessPassword | platform.AccessMultiline | platform.AccessSelectable | platform.AccessMultiselectable; fresh[i] || prev[i].Role != an.n.Role || prev[i].States&roleStates != an.n.States&roleStates {
 			atkObjectSetRole(an.obj, an.role())
 		}
 		if fresh[i] || prev[i].Label != an.n.Label {
 			atkObjectSetName(an.obj, cs(an.n.Label))
+		}
+		if fresh[i] || prev[i].Description != an.n.Description {
+			atkObjectSetDescription(an.obj, cs(an.n.Description))
 		}
 	}
 	if notify {
@@ -424,6 +532,23 @@ func (t *accessTree) update(tree *platform.AccessTree) {
 			}
 		}
 	}
+	// Lists choosing their rows tell when the choice moves.
+	for _, an := range list {
+		if an.typ != selectionType {
+			continue
+		}
+		var chosen []uint64
+		for _, r := range an.chosenRows() {
+			chosen = append(chosen, r.n.ID)
+		}
+		if !slices.Equal(chosen, an.chosen) {
+			an.chosen = chosen
+			if notify {
+				gSignalEmit(an.obj, cs("selection-changed"))
+			}
+		}
+	}
+	t.graft(list)
 	for _, an := range old {
 		an.release()
 	}
@@ -434,6 +559,11 @@ func (t *accessTree) update(tree *platform.AccessTree) {
 		t.focus = focus
 		if an := t.nodes[focus]; an != nil && notify {
 			atkObjectNotifyStateChange(an.obj, uint64(atkStates.focused), true)
+		}
+	}
+	if announces && notify {
+		for _, text := range tree.Announcements {
+			gSignalEmitAnnouncement(t.root, cs("announcement"), cs(text))
 		}
 	}
 }
@@ -491,7 +621,10 @@ func (an *accessNode) notifyChanges(prev platform.AccessNode) {
 // stateList returns the ATK states of a node.
 func stateList(n platform.AccessNode, focused bool) []int32 {
 	st := &atkStates
-	list := []int32{st.visible, st.showing}
+	list := []int32{st.visible}
+	if n.States&platform.AccessOffscreen == 0 {
+		list = append(list, st.showing)
+	}
 	if n.States&platform.AccessDisabled == 0 {
 		list = append(list, st.enabled, st.sensitive)
 	}
@@ -502,16 +635,38 @@ func stateList(n platform.AccessNode, focused bool) []int32 {
 		list = append(list, st.focused)
 	}
 	switch n.Role {
-	case platform.RoleCheckBox, platform.RoleRadio, platform.RoleSwitch:
+	case platform.RoleCheckBox, platform.RoleRadio, platform.RoleSwitch, platform.RoleMenuItemCheckBox, platform.RoleMenuItemRadio:
 		list = append(list, st.checkable)
-	case platform.RoleTab, platform.RoleTreeItem, platform.RoleRow:
+	case platform.RoleTab, platform.RoleTreeItem, platform.RoleRow, platform.RoleListItem:
+		// Rows and items of lists only where their list chooses them.
+		if n.States&platform.AccessSelectable == 0 && (n.Role == platform.RoleRow || n.Role == platform.RoleListItem) {
+			break
+		}
 		list = append(list, st.selectable)
 		if n.States&platform.AccessChecked != 0 {
 			list = append(list, st.selected) // not checked
 		}
 	case platform.RolePopUpButton:
 		list = append(list, st.expandable)
-	case platform.RoleTextField:
+	case platform.RoleSlider:
+		// As GtkScale's.
+		if n.States&platform.AccessVertical != 0 {
+			list = append(list, st.vertical)
+		} else {
+			list = append(list, st.horizontal)
+		}
+	case platform.RoleDisclosure:
+		// Checked while open, as GTK's expanders.
+		list = append(list, st.expandable)
+		if n.States&platform.AccessExpanded != 0 {
+			list = append(list, st.checked)
+		}
+	case platform.RoleMenuButton:
+		list = append(list, st.hasPopup)
+	case platform.RoleTextField, platform.RoleComboBox:
+		if n.Role == platform.RoleComboBox {
+			list = append(list, st.expandable)
+		}
 		list = append(list, st.selectableText)
 		if n.States&platform.AccessReadOnly == 0 {
 			list = append(list, st.editable)
@@ -524,14 +679,24 @@ func stateList(n platform.AccessNode, focused bool) []int32 {
 			list = append(list, st.singleLine)
 		}
 	}
-	if n.States&platform.AccessChecked != 0 && n.Role != platform.RoleTab && n.Role != platform.RoleTreeItem && n.Role != platform.RoleRow {
+	// A toggle button is checked while pressed, as GTK's are.
+	if n.States&platform.AccessChecked != 0 && n.Role != platform.RoleTab && n.Role != platform.RoleTreeItem && n.Role != platform.RoleRow && n.Role != platform.RoleListItem {
 		list = append(list, st.checked)
 	}
 	if n.States&platform.AccessMixed != 0 || n.Now < n.Min {
 		list = append(list, st.indeterminate) // a progress of unknown length
 	}
+	if n.States&platform.AccessExpandable != 0 {
+		list = append(list, st.expandable)
+	}
 	if n.States&platform.AccessExpanded != 0 {
 		list = append(list, st.expanded)
+	}
+	if n.States&platform.AccessMultiselectable != 0 {
+		list = append(list, st.multiselectable)
+	}
+	if n.States&platform.AccessInvalid != 0 {
+		list = append(list, st.invalidEntry)
 	}
 	return slices.DeleteFunc(list, func(s int32) bool { return s == 0 })
 }
@@ -664,9 +829,38 @@ func initAccessCallbacks() {
 		}
 		return 0
 	})
+	// In the overlay holding web views, the surface is its only child.
+	rootIndex := purego.NewCallback(func(root ptr) int32 {
+		if s := surfaceAreas[gtkAccessibleGetWidget(root)]; s != nil && s.layers != 0 && overlayType != 0 {
+			return 0
+		}
+		r, _, _ := purego.SyscallN(rootParentIndex, root)
+		return int32(r)
+	})
 	cbRootClassInit = purego.NewCallback(func(class, data ptr) {
 		*slot(class, atkGetNChildren) = rootChildren
 		*slot(class, atkRefChild) = rootChild
+		rootParentIndex = *slot(class, atkGetIndexInParent)
+		*slot(class, atkGetIndexInParent) = rootIndex
+	})
+	overlayChildren := purego.NewCallback(func(obj ptr) int32 {
+		if layersOf(gtkAccessibleGetWidget(obj)) != nil {
+			return 1
+		}
+		return 0
+	})
+	overlayChild := purego.NewCallback(func(obj ptr, i int32) ptr {
+		if s := layersOf(gtkAccessibleGetWidget(obj)); s != nil && i == 0 {
+			return gObjectRef(gtkWidgetGetAccessible(s.area))
+		}
+		return 0
+	})
+	cbOverlayAccessClassInit = purego.NewCallback(func(class, data ptr) {
+		*slot(class, atkGetNChildren) = overlayChildren
+		*slot(class, atkRefChild) = overlayChild
+	})
+	cbOverlayClassInit = purego.NewCallback(func(class, data ptr) {
+		gtkWidgetClassSetAccessibleType(class, overlayAccessType)
 	})
 	rootAt := purego.NewCallback(func(root ptr, x, y, coords int32) ptr {
 		if t := rootTree(root); t != nil {
@@ -679,12 +873,17 @@ func initAccessCallbacks() {
 	})
 
 	children := purego.NewCallback(func(obj ptr) int32 {
-		if an := node(obj); an != nil {
+		if an := node(obj); an != nil && an.page != 0 {
+			return 1
+		} else if an != nil {
 			return int32(len(an.children))
 		}
 		return 0
 	})
 	child := purego.NewCallback(func(obj ptr, i int32) ptr {
+		if an := node(obj); an != nil && an.page != 0 && i == 0 {
+			return gObjectRef(an.page)
+		}
 		if an := node(obj); an != nil && i >= 0 && int(i) < len(an.children) {
 			return gObjectRef(an.children[i].obj)
 		}
@@ -713,14 +912,39 @@ func initAccessCallbacks() {
 		}
 		return set
 	})
+	// Object attributes: the placeholder of a text field, and the place of
+	// a row among its list's, which Orca reads as "5 of 10000".
 	attributes := purego.NewCallback(func(obj ptr) ptr {
 		an := node(obj)
-		if an == nil || an.n.Placeholder == "" {
+		if an == nil {
 			return 0
 		}
-		attr := gMalloc0(16) // AtkAttribute: name, value
-		*slot(attr, 0), *slot(attr, 8) = cString("placeholder-text"), cString(an.n.Placeholder)
-		return gSlistAppend(0, attr)
+		var list ptr
+		add := func(name, value string) {
+			attr := gMalloc0(16) // AtkAttribute: name, value
+			*slot(attr, 0), *slot(attr, 8) = cString(name), cString(value)
+			list = gSlistAppend(list, attr)
+		}
+		if an.n.Placeholder != "" {
+			add("placeholder-text", an.n.Placeholder)
+		}
+		if an.n.PosInSet > 0 {
+			add("posinset", strconv.Itoa(an.n.PosInSet))
+		}
+		if an.n.SetSize > 0 {
+			add("setsize", strconv.Itoa(an.n.SetSize))
+		}
+		if an.n.Level > 0 {
+			add("level", strconv.Itoa(an.n.Level))
+		}
+		// The order of the column a table is sorted by, as Chromium says.
+		switch {
+		case an.n.States&platform.AccessSortAscending != 0:
+			add("sort", "ascending")
+		case an.n.States&platform.AccessSortDescending != 0:
+			add("sort", "descending")
+		}
+		return list
 	})
 	cbNodeClassInit = purego.NewCallback(func(class, data ptr) {
 		*slot(class, atkGetNChildren) = children
@@ -735,6 +959,9 @@ func initAccessCallbacks() {
 		return an != nil && an.contains(x, y, coords)
 	})
 	nodeAt := purego.NewCallback(func(obj ptr, x, y, coords int32) ptr {
+		if an := node(obj); an != nil && an.page != 0 {
+			return gObjectRef(an.page)
+		}
 		if an := node(obj); an != nil {
 			return at(an.children, x, y, coords)
 		}
@@ -758,37 +985,74 @@ func initAccessCallbacks() {
 		an.act(platform.AccessFocus, "")
 		return true
 	})
+	// What assistive technology moves to out of view scrolls into view.
+	scrollTo := purego.NewCallback(func(obj ptr, how int32) bool {
+		an := node(obj)
+		if an == nil || an.n.Actions&platform.ActionScrollIntoView == 0 {
+			return false
+		}
+		an.act(platform.AccessScrollIntoView, "")
+		return true
+	})
+	// scroll_to arrived in ATK 2.30, past the end of the interface before.
+	scrolls := atkGetMajorVersion() > 2 || atkGetMinorVersion() >= 30
 	cbComponentInit = purego.NewCallback(func(iface, data ptr) {
-		setIface(iface, map[int]ptr{1: contains, 2: nodeAt, 3: extents, 6: grabFocus})
+		fns := map[int]ptr{1: contains, 2: nodeAt, 3: extents, 6: grabFocus}
+		if scrolls {
+			fns[15] = scrollTo
+		}
+		setIface(iface, fns)
 	})
 
-	pressable := func(obj ptr, i int32) *accessNode {
-		if an := node(obj); an != nil && i == 0 && an.n.Actions&platform.ActionPress != 0 {
-			return an
+	// The actions of a node: click, then expand or contract, for an item
+	// of a tree with children, as GTK's tree views have.
+	actions := func(obj ptr) (*accessNode, []platform.AccessActions) {
+		an := node(obj)
+		if an == nil {
+			return nil, nil
 		}
-		return nil
+		var list []platform.AccessActions
+		for _, a := range []platform.AccessActions{platform.ActionPress, platform.ActionExpand} {
+			if an.n.Actions&a != 0 {
+				list = append(list, a)
+			}
+		}
+		return an, list
+	}
+	action := func(obj ptr, i int32) (*accessNode, platform.AccessActions) {
+		an, list := actions(obj)
+		if i < 0 || int(i) >= len(list) {
+			return nil, 0
+		}
+		return an, list[i]
 	}
 	doAction := purego.NewCallback(func(obj ptr, i int32) bool {
-		an := pressable(obj, i)
-		if an != nil {
+		an, a := action(obj, i)
+		switch {
+		case a == platform.ActionPress:
 			an.act(platform.AccessPress, "")
+		case a == platform.ActionExpand && an.n.States&platform.AccessExpanded != 0:
+			an.act(platform.AccessCollapse, "")
+		case a == platform.ActionExpand:
+			an.act(platform.AccessExpand, "")
 		}
 		return an != nil
 	})
 	nActions := purego.NewCallback(func(obj ptr) int32 {
-		if pressable(obj, 0) != nil {
-			return 1
-		}
-		return 0
+		_, list := actions(obj)
+		return int32(len(list))
 	})
 	actionName := purego.NewCallback(func(obj ptr, i int32) ptr {
-		if pressable(obj, i) != nil {
+		switch _, a := action(obj, i); a {
+		case platform.ActionPress:
 			return ptr(unsafe.Pointer(&clickName[0]))
+		case platform.ActionExpand:
+			return ptr(unsafe.Pointer(&expandName[0]))
 		}
 		return 0
 	})
 	actionEmpty := purego.NewCallback(func(obj ptr, i int32) ptr {
-		if pressable(obj, i) != nil {
+		if an, _ := action(obj, i); an != nil {
 			return ptr(unsafe.Pointer(&emptyName[0]))
 		}
 		return 0
@@ -809,6 +1073,10 @@ func initAccessCallbacks() {
 	current := valueOf(func(n platform.AccessNode) float64 { return max(n.Now, n.Min) })
 	maximum := valueOf(func(n platform.AccessNode) float64 { return n.Max })
 	minimum := valueOf(func(n platform.AccessNode) float64 { return n.Min })
+	// The step, through the GValue of get_minimum_increment: callbacks
+	// return no floats for get_increment, which AT-SPI's bridge then
+	// leaves for this.
+	increment := valueOf(func(n platform.AccessNode) float64 { return n.Step })
 	valueAndText := purego.NewCallback(func(obj, value, text ptr) {
 		if an := node(obj); an != nil && value != 0 {
 			*(*float64)(unsafe.Pointer(slot(value, 0))) = max(an.n.Now, an.n.Min)
@@ -836,8 +1104,9 @@ func initAccessCallbacks() {
 	})
 	cbValueInit = purego.NewCallback(func(iface, data ptr) {
 		// get_current_value, get_maximum_value, get_minimum_value,
-		// get_value_and_text, get_range and set_value.
-		setIface(iface, map[int]ptr{0: current, 1: maximum, 2: minimum, 5: valueAndText, 6: valueRange, 9: setValue})
+		// get_minimum_increment, get_value_and_text, get_range and
+		// set_value.
+		setIface(iface, map[int]ptr{0: current, 1: maximum, 2: minimum, 4: increment, 5: valueAndText, 6: valueRange, 9: setValue})
 	})
 
 	getText := purego.NewCallback(func(obj ptr, start, end int32) ptr {
@@ -915,6 +1184,50 @@ func initAccessCallbacks() {
 			12: selection, 23: stringAtOffset})
 	})
 
+	// The rows a list chooses, which choosing a row as a click does
+	// changes: it chooses that row alone.
+	childAt := func(obj ptr, i int32) *accessNode {
+		if an := node(obj); an != nil && i >= 0 && int(i) < len(an.children) {
+			return an.children[i]
+		}
+		return nil
+	}
+	addSelection := purego.NewCallback(func(obj ptr, i int32) bool {
+		c := childAt(obj, i)
+		if c == nil || !chooses(c.n) || c.n.Actions&platform.ActionPress == 0 {
+			return false
+		}
+		c.act(platform.AccessPress, "")
+		return true
+	})
+	refuse := purego.NewCallback(func(obj ptr) bool { return false })
+	refuseAt := purego.NewCallback(func(obj ptr, i int32) bool { return false })
+	refSelection := purego.NewCallback(func(obj ptr, i int32) ptr {
+		if an := node(obj); an != nil {
+			if rows := an.chosenRows(); i >= 0 && int(i) < len(rows) {
+				return gObjectRef(rows[i].obj)
+			}
+		}
+		return 0
+	})
+	selectionCount := purego.NewCallback(func(obj ptr) int32 {
+		if an := node(obj); an != nil {
+			return int32(len(an.chosenRows()))
+		}
+		return 0
+	})
+	isSelected := purego.NewCallback(func(obj ptr, i int32) bool {
+		c := childAt(obj, i)
+		return c != nil && chooses(c.n) && c.n.States&platform.AccessChecked != 0
+	})
+	cbSelectionInit = purego.NewCallback(func(iface, data ptr) {
+		// add_selection, clear_selection, ref_selection,
+		// get_selection_count, is_child_selected, remove_selection and
+		// select_all_selection.
+		setIface(iface, map[int]ptr{0: addSelection, 1: refuse, 2: refSelection, 3: selectionCount, 4: isSelected,
+			5: refuseAt, 6: refuse})
+	})
+
 	editable := func(obj ptr) *accessNode {
 		if an := node(obj); an != nil && an.n.Actions&platform.ActionSetValue != 0 {
 			return an
@@ -947,4 +1260,32 @@ func initAccessCallbacks() {
 		// set_text_contents, insert_text and delete_text.
 		setIface(iface, map[int]ptr{1: setContents, 2: insert, 5: remove})
 	})
+}
+
+// graft puts the pages of the surface's web views in the nodes of list
+// standing for them, and takes those of the others out.
+func (t *accessTree) graft(list []*accessNode) {
+	grafted := map[*window]bool{}
+	for _, an := range list {
+		an.page = 0
+		v, ok := an.n.WebView.(*window)
+		if !ok || grafted[v] || v.closed || v.host == nil || v.host.surface != t.s {
+			continue
+		}
+		if acc := v.pageAccessible(); acc != 0 {
+			grafted[v], an.page = true, acc
+			if v.accessParent != an.obj {
+				v.accessParent = an.obj
+				atkObjectSetParent(acc, an.obj)
+			}
+		}
+	}
+	for _, v := range t.s.w.webViews {
+		if !grafted[v] && v.accessParent != 0 {
+			v.accessParent = 0
+			if acc := v.pageAccessible(); acc != 0 {
+				atkObjectSetParent(acc, 0)
+			}
+		}
+	}
 }

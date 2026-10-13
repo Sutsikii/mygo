@@ -40,7 +40,9 @@ type Application struct {
 	menu      *Menu
 	menuSet   bool
 	paths     map[PathName]string
-	finished  sync.Once
+	// stateStore is the WindowStateStore, or nil for the file.
+	stateStore WindowStateStore
+	finished   sync.Once
 
 	// quitting is only touched on the main thread.
 	quitting    bool
@@ -61,6 +63,8 @@ type Application struct {
 	onOpenURL         listeners[func(string)]
 	onOpenFile        listeners[func(string)]
 	onWindowCreated   listeners[func(*Window)]
+
+	onNotificationClick listeners[func(string)]
 }
 
 // App is the application singleton.
@@ -74,8 +78,9 @@ var App = &Application{readyCh: make(chan struct{}), Dock: &Dock{}}
 // immediately.
 //
 // When the MYGO_GENERATE environment variable is set (see `mygo generate`),
-// Run writes the TypeScript client for the bound services to that path and
-// returns without starting the event loop.
+// Run writes the TypeScript client for the bound services to that path, or
+// nothing when the app binds none, and returns without starting the event
+// loop.
 func (a *Application) Run() error {
 	if out := os.Getenv("MYGO_GENERATE"); out != "" {
 		return WriteTypeScript(out)
@@ -191,12 +196,18 @@ func (a *Application) prepareQuit() bool {
 		a.quitting = false
 		return false
 	}
+	// Providers are application-owned, independent of the windows just
+	// closed. Persist them before the native loop ends; callers needing
+	// error handling may Flush explicitly from a quit listener.
+	_ = Clipboard.Flush()
 	return true
 }
 
 // finish runs once after the event loop has stopped.
 func (a *Application) finish() {
 	a.finished.Do(func() {
+		clipboardStopped = true
+		backend().Clipboard().Close()
 		saveWindowStates()
 		fire(&a.onQuit)
 		if a.relaunch {
@@ -247,7 +258,6 @@ func (a *Application) handleReady() {
 	}
 	// After the windows the app opens when ready, which URLs may target.
 	postMain(launchArgs)
-	devReadyAfterLaunch()
 }
 
 // waitReady blocks a goroutine other than the main one until the
@@ -466,6 +476,16 @@ func (a *Application) OnOpenFile(fn func(path string)) (off func()) {
 	return a.onOpenFile.add(fn, false)
 }
 
+// OnNotificationClick is called with the ID of every notification of the
+// app that the user clicks, after its OnClick listeners: also one of an
+// earlier run, which no Notification of this run holds, such as the one
+// whose click launched the app (macOS). Register it before Run to receive
+// that one. Give notifications IDs of the app's own, such as the
+// conversation they are about, to know what to open.
+func (a *Application) OnNotificationClick(fn func(id string)) (off func()) {
+	return a.onNotificationClick.add(fn, false)
+}
+
 // OnWindowCreated is called for every new window.
 func (a *Application) OnWindowCreated(fn func(w *Window)) (off func()) {
 	return a.onWindowCreated.add(fn, false)
@@ -570,7 +590,7 @@ func (appHandler) OpenFiles(paths []string) {
 		fire1(&App.onOpenFile, p)
 	}
 }
-func (appHandler) MenuItemClicked(id int)        { menuItemClicked(id) }
+func (appHandler) MenuItemClicked(id int)        { menuItemClicked(id, FocusedWindow()) }
 func (appHandler) ThemeChanged()                 { updateBackgrounds(); contentThemeChanged(); Theme.changed() }
 func (appHandler) DisplaysChanged()              { Screen.changed() }
 func (appHandler) PowerEvent(event string)       { Power.event(event) }

@@ -6,9 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -133,13 +133,15 @@ func (in *buildInputs) equal(o *buildInputs) bool {
 		slices.Equal(in.files, o.files) && in.resources == o.resources && slices.Equal(in.trees, o.trees)
 }
 
-func fingerprint(in *buildInputs) uint64 {
-	h := fnv.New64a()
+// snapshot stamps each input with what tells that it changed: "-" when it
+// is missing.
+func snapshot(in *buildInputs) map[string]string {
+	s := map[string]string{}
 	add := func(path string, info os.FileInfo) {
-		fmt.Fprintf(h, "%s\x00%v\x00%d\x00%d\x00", path, info.Mode(), info.Size(), info.ModTime().UnixNano())
+		s[path] = fmt.Sprintf("%v %d %d", info.Mode(), info.Size(), info.ModTime().UnixNano())
 	}
 	list := func(dir string, keep func(name string) bool) {
-		entries, _ := os.ReadDir(dir)
+		entries, _ := readDir(dir)
 		for _, e := range entries {
 			if e.IsDir() || !keep(e.Name()) {
 				continue
@@ -155,27 +157,29 @@ func fingerprint(in *buildInputs) uint64 {
 		})
 	}
 	for _, dir := range in.fileDirs {
-		list(dir, func(string) bool { return true })
+		// Builds write their Windows resources into the main package,
+		// which may embed files too.
+		list(dir, func(name string) bool { return !mygoSyso(name) })
 	}
 	for _, f := range in.files {
 		if info, err := os.Stat(f); err == nil {
 			add(f, info)
 		} else {
-			fmt.Fprintf(h, "%s\x00-\x00", f)
+			s[f] = "-"
 		}
 	}
 	tree := func(t string) {
 		err := walkResource(t, func(path string, info fs.FileInfo) error {
 			if info.IsDir() {
 				// Its time changes with hidden files too.
-				fmt.Fprintf(h, "%s\x00dir\x00", path)
+				s[path] = "dir"
 			} else {
 				add(path, info)
 			}
 			return nil
 		})
 		if err != nil {
-			fmt.Fprintf(h, "%s\x00-\x00", t)
+			s[t] = "-"
 		}
 	}
 	// The entries of the resources directory are followed like listed
@@ -183,9 +187,9 @@ func fingerprint(in *buildInputs) uint64 {
 	// platform, which is the one mygo dev builds for.
 	var entries func(dir string, platforms bool)
 	entries = func(dir string, platforms bool) {
-		list, err := os.ReadDir(dir)
+		list, err := readDir(dir)
 		if err != nil {
-			fmt.Fprintf(h, "%s\x00-\x00", dir)
+			s[dir] = "-"
 			return
 		}
 		for _, e := range list {
@@ -205,16 +209,31 @@ func fingerprint(in *buildInputs) uint64 {
 	for _, t := range in.trees {
 		tree(t)
 	}
-	return h.Sum64()
+	return s
 }
 
-// watch polls every interval and signals on the returned channel once
-// inputs changed and then stayed unchanged for an interval, so that a burst
-// of writes (a formatter, a branch switch) causes a single rebuild.
-func (w *watcher) watch(ctx context.Context, interval time.Duration) <-chan struct{} {
-	ch := make(chan struct{}, 1)
+// readDir is os.ReadDir, but lets others delete the directory while it
+// reads it (openDir), as the watcher reads directories all the time.
+func readDir(name string) ([]os.DirEntry, error) {
+	f, err := openDir(name)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	entries, err := f.ReadDir(-1)
+	slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	return entries, err
+}
+
+// watch polls every interval and sends the paths of the inputs that changed
+// on the returned channel once they stayed unchanged for an interval, so
+// that a burst of writes (a formatter, a branch switch) causes a single
+// rebuild.
+func (w *watcher) watch(ctx context.Context, interval time.Duration) <-chan []string {
+	ch := make(chan []string, 1)
 	go func() {
-		var last uint64
+		var last map[string]string
+		changed := map[string]bool{}
 		settling := false
 		tick := time.NewTicker(interval)
 		defer tick.Stop()
@@ -231,18 +250,35 @@ func (w *watcher) watch(ctx context.Context, interval time.Duration) <-chan stru
 			if in == nil {
 				continue
 			}
-			cur := fingerprint(in)
+			cur := snapshot(in)
 			switch {
 			case reset:
 				last, settling = cur, false
-			case cur != last:
+				clear(changed)
+			case !maps.Equal(cur, last):
+				for p, v := range cur {
+					if last[p] != v {
+						changed[p] = true
+					}
+				}
+				for p := range last {
+					if _, ok := cur[p]; !ok {
+						changed[p] = true
+					}
+				}
 				last, settling = cur, true
 			case settling:
 				settling = false
+				// Along with those not taken yet.
 				select {
-				case ch <- struct{}{}:
+				case paths := <-ch:
+					for _, p := range paths {
+						changed[p] = true
+					}
 				default:
 				}
+				ch <- slices.Sorted(maps.Keys(changed))
+				clear(changed)
 			}
 		}
 	}()

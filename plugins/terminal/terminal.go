@@ -4,7 +4,7 @@
 //
 //	term, err := terminal.New(terminal.Options{})
 //	...
-//	mygo.NewWindow(mygo.WindowOptions{Title: "Terminal", Content: ui.View(func(c *ui.Context) {
+//	mygo.NewWindow(mygo.WindowOptions{Title: "Terminal", Content: ui.View(func(c ui.Frame) {
 //		terminal.View(c, term).Fill()
 //	})})
 //
@@ -38,6 +38,7 @@ import (
 
 	"github.com/egoist/mygo/plugins/terminal/internal/pty"
 	"github.com/egoist/mygo/plugins/terminal/internal/vt"
+	"github.com/egoist/mygo/ui"
 )
 
 // Options configure a terminal.
@@ -78,6 +79,13 @@ type Options struct {
 	// OptionAsAlt makes Option on macOS the Alt key of programs (Meta),
 	// rather than the key that types accented letters and symbols.
 	OptionAsAlt bool
+	// Transparent leaves the terminal's background undrawn, so that what
+	// is under the view shows through, as the window's material or an
+	// element's translucent background, as Ghostty's background-opacity
+	// does: cells with a background color of their own still draw it.
+	// Give the theme the background the view shows on, which the text
+	// under a block cursor takes.
+	Transparent bool
 
 	// OnTitle, OnExit, OnBell and OnNotify run on a goroutine of the
 	// terminal when a program sets the title, when the program (or Conn)
@@ -88,6 +96,41 @@ type Options struct {
 	OnExit   func(code int)
 	OnBell   func()
 	OnNotify func(title, body string)
+
+	// OpenLink takes what a Command+click (Control+click elsewhere)
+	// opens: a hyperlink (OSC 8), a URL printed as text, or, only with
+	// OpenLink set, a file path printed as text (absolute, ~/, ./ or ../,
+	// one with a slash, or a file name with a :line), as printed, a
+	// :line:col suffix included; a relative one is the program's, as of
+	// Dir. It runs on the main thread and reports whether it opened the
+	// link; a hyperlink or a URL it leaves, or every one when it is nil,
+	// opens with the system (Context.OpenURL), and a path it leaves does
+	// nothing.
+	OpenLink func(link string) bool
+	// OnPaste sees a paste (Command+V, Control+Shift+V elsewhere, or a
+	// Paste menu item) before the program gets it, on the main thread:
+	// text is the clipboard's text, empty when it holds none, as with an
+	// image. It reports whether it took the paste; a paste taken sends
+	// nothing, as when an app uploads the clipboard's files for a remote
+	// program and pastes their paths instead.
+	OnPaste func(text string) bool
+	// OnKey sees a key press before the terminal encodes it, on the main
+	// thread, and reports whether it took the key; a key taken sends
+	// nothing, neither the text it types nor its release. Unlike a
+	// shortcut of an element around the view, which runs with the next
+	// frame, it keeps its place among the keys typed after it, as does
+	// what it sends with Send. A key that only types text may come as its
+	// text alone, as on Linux, which OnKey does not see.
+	OnKey func(mods ui.Modifiers, key ui.Key) bool
+	// OnScroll sees the wheel scroll the view by whole rows, negative up,
+	// before the terminal scrolls its scrollback, on the main thread, and
+	// reports whether it took the scroll; a scroll taken moves nothing. It
+	// is not asked while a program takes the wheel: as the mouse, unless
+	// Shift is held, or, on a full-screen program's screen, as arrow keys
+	// (alternate scroll, which "\x1b[?1007l" turns off). It suits a Conn
+	// whose history lives at the other end, as a remote multiplexer
+	// streaming only its screen.
+	OnScroll func(rows int) bool
 }
 
 // CursorStyle is the shape of the cursor.
@@ -493,6 +536,28 @@ func (t *Terminal) Text() string {
 		return ""
 	}
 	return t.term.Text()
+}
+
+// Resize sets the size of the screen in cells, for a terminal no view
+// shows, as one a server keeps for a session while no window does: a view
+// sets the size of the terminal it shows.
+func (t *Terminal) Resize(cols, rows int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.resize(gridSize{max(cols, 1), max(rows, 1), t.size.cellW, t.size.cellH})
+}
+
+// Snapshot returns what the terminal shows as escape sequences: its
+// scrollback and screen with their styles, the cursor and the modes
+// programs set. Fed to a new terminal of the same size, it shows the same,
+// as a terminal attaching again to a session a server keeps.
+func (t *Terminal) Snapshot() []byte {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.term == nil {
+		return nil
+	}
+	return t.term.VT()
 }
 
 // Send sends data to the program as if typed.

@@ -2,13 +2,13 @@ package ui
 
 import (
 	"errors"
-	"image"
 	"testing"
 	"time"
 
 	"github.com/egoist/mygo/internal/platform"
 	"github.com/egoist/mygo/internal/scene"
 	"github.com/egoist/mygo/internal/surface"
+	"github.com/egoist/mygo/transfer"
 )
 
 // testSurface is a surface that counts the frames drawn in memory.
@@ -17,10 +17,20 @@ type testSurface struct{ pixels int }
 func (s *testSurface) Native() platform.SurfaceNative           { return platform.SurfaceNative{HWND: 1} }
 func (s *testSurface) Size() (float64, float64, float64)        { return 200, 100, 1 }
 func (s *testSurface) RequestFrame()                            {}
+func (s *testSurface) RefreshRate() float64                     { return 60 }
 func (s *testSurface) PresentPixels([]byte, int, int, int)      { s.pixels++ }
 func (s *testSurface) SetCursor(platform.Cursor)                {}
 func (s *testSurface) SetTextInput(platform.TextInputState)     {}
 func (s *testSurface) UpdateAccessibility(*platform.AccessTree) {}
+func (s *testSurface) StartDataDrag(r platform.DragRequest) {
+	r.Done(transfer.Result{Err: platform.ErrUnsupported})
+}
+func (s *testSurface) CancelDataDrag()                  {}
+func (s *testSurface) SetDropFormats([]transfer.Format) {}
+func (s *testSurface) NewWebView(*platform.WindowOptions, platform.WindowHandler) (platform.WebView, error) {
+	return nil, platform.ErrUnsupported
+}
+func (s *testSurface) PlaceWebViews([]platform.WebViewPlacement) {}
 
 // testGPU is a GPU renderer whose device goes away when fail is set.
 type testGPU struct {
@@ -46,7 +56,7 @@ func gpuHost(t *testing.T, make func() (gpuRenderer, error)) (*windowHost, *test
 	t.Cleanup(func() { newGPU = newGPURenderer })
 	s := &testSurface{}
 	h := &windowHost{conn: &surface.Conn{Surface: s}}
-	h.rt = newRuntime(func(c *Context) { Text(c, "Hello") }, h)
+	h.rt = newRuntime(func(c *context) { coreText(c, "Hello") }, h)
 	return h, s, func() { h.event(platform.SurfaceEvent{Kind: platform.SurfaceFrame}) }
 }
 
@@ -164,81 +174,45 @@ func TestNoGPUFromTheStart(t *testing.T) {
 	}
 }
 
-// pixelGPU is a GPU renderer that also presents frames drawn in memory, as
-// Metal's does.
-type pixelGPU struct {
-	testGPU
-	pixels int
-	damage []image.Rectangle
-}
-
-func (g *pixelGPU) PresentPixels(pix []byte, stride, width, height int, scale float64, damage []image.Rectangle) error {
-	g.pixels++
-	g.damage = append(g.damage[:0], damage...)
-	return nil
-}
-
-// TestSmallChangesDrawOnCPU checks which frames the CPU draws and which
-// the GPU does.
-func TestSmallChangesDrawOnCPU(t *testing.T) {
-	g := &pixelGPU{}
+// TestEveryFrameOnTheGPU checks that with a GPU, every frame draws on it:
+// the first, one changing little after a pause, and one changing little
+// while frames follow each other.
+func TestEveryFrameOnTheGPU(t *testing.T) {
+	g := &testGPU{}
 	h, s, frame := gpuHost(t, func() (gpuRenderer, error) { return g, nil })
-	x, back := float32(10), RGB(200, 200, 200)
-	h.rt = newRuntime(func(c *Context) {
-		Box(c).Fill().Background(back).Children(func() {
-			Box(c).Size(10, 10).Background(RGB(0, 0, 255)).Absolute().Left(x).Top(10)
+	x := float32(10)
+	h.rt = newRuntime(func(c *context) {
+		coreBox(c).Fill().Background(RGB(200, 200, 200)).Children(func() {
+			coreBox(c).Size(10, 10).Background(RGB(0, 0, 255)).Absolute().Left(x).Top(10)
 		})
 	}, h)
-	pause := func() { h.lastFrame = time.Now().Add(-time.Second) }
-	check := func(what string, pixels, frames int) {
-		t.Helper()
-		if g.pixels != pixels || g.frames != frames || s.pixels != 0 {
-			t.Fatalf("%s: %d frames drawn on the CPU, %d on the GPU, %d in memory without the GPU", what, g.pixels, g.frames, s.pixels)
-		}
-	}
 	frame()
-	check("the first frame", 1, 0)
-	if len(g.damage) != 1 || g.damage[0] != image.Rect(0, 0, 200, 100) {
-		t.Errorf("the first frame changed %v", g.damage)
-	}
-	// A small change after a pause, and in a burst.
-	pause()
+	h.lastFrame = time.Now().Add(-time.Second)
 	x = 30
 	frame()
-	check("a small change after a pause", 2, 0)
-	if len(g.damage) == 0 || g.damage[0].Dx() > 40 || g.damage[0].Dy() > 20 {
-		t.Errorf("moving the square changed %v", g.damage)
-	}
 	x = 40
 	frame()
-	check("a small change in a burst", 3, 0)
-	// Much of the window in a burst goes to the GPU, and back to the CPU
-	// after a pause.
-	back = RGB(100, 100, 100)
-	frame()
-	check("a large change in a burst", 3, 1)
-	pause()
-	x = 50
-	frame()
-	check("a small change after a pause, the CPU's frame being old", 4, 1)
-	if len(g.damage) != 1 || g.damage[0] != image.Rect(0, 0, 200, 100) {
-		t.Errorf("catching up changed %v", g.damage)
+	if g.frames != 3 || s.pixels != 0 || h.path != "drawn on the GPU" {
+		t.Errorf("%d frames on the GPU, %d drawn in memory, the last %q", g.frames, s.pixels, h.path)
 	}
-	// The CPU's frame goes once the GPU has drawn alone for a second.
-	back = RGB(50, 50, 50)
+}
+
+func TestTransformedFramesStayOnGPU(t *testing.T) {
+	g := &testGPU{}
+	h, s, frame := gpuHost(t, func() (gpuRenderer, error) { return g, nil })
+	active := true
+	h.rt = newRuntime(func(c *context) {
+		coreBox(c).Size(30, 20).Translate(10, 10).Rotate(8).Background(RGB(50, 80, 200))
+		if active {
+			c.AnimationFrame()
+		}
+	}, h)
 	frame()
-	check("a large change", 4, 2)
-	if h.soft.Image.Pix == nil {
-		t.Fatal("the CPU's frame went at once")
+	frame()
+	active = false
+	h.lastFrame = time.Now().Add(-time.Second)
+	frame()
+	if g.frames != 3 || s.pixels != 0 || h.soft.Image.Pix != nil {
+		t.Fatal("active or resting transforms switched to CPU rendering")
 	}
-	h.gpuSinceCPU = time.Now().Add(-2 * time.Second)
-	back = RGB(60, 60, 60)
-	frame()
-	check("a large change, a second later", 4, 3)
-	if h.soft.Image.Pix != nil {
-		t.Error("the CPU's frame stays while the GPU draws alone")
-	}
-	pause()
-	frame()
-	check("the next frame after a pause", 5, 3)
 }

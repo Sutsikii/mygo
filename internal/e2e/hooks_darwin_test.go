@@ -3,6 +3,9 @@
 package e2e
 
 import (
+	"testing"
+	"time"
+
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/internal/darwin"
 )
@@ -24,6 +27,31 @@ func endSheet(w *mygo.Window) (ok bool, supported bool) {
 
 func click(w *mygo.Window, x, y float64) bool {
 	mygo.RunOnMain(func() { darwin.TestClick(w.NativeHandle(), x, y) })
+	return true
+}
+
+// appClick clicks through the application, whose event monitors see it.
+func appClick(w *mygo.Window, x, y float64) bool {
+	mygo.RunOnMain(func() { darwin.TestAppClick(w.NativeHandle(), x, y) })
+	return true
+}
+
+// heldAppClick is appClick with the button held down a while, as a user
+// clicks: what the press did runs before the release.
+func heldAppClick(w *mygo.Window, x, y float64) bool {
+	mygo.RunOnMain(func() { darwin.TestAppPress(w.NativeHandle(), x, y, true) })
+	time.Sleep(150 * time.Millisecond)
+	mygo.RunOnMain(func() { darwin.TestAppPress(w.NativeHandle(), x, y, false) })
+	return true
+}
+
+func sideButton(w *mygo.Window, back bool) (ok bool) {
+	mygo.RunOnMain(func() { ok = darwin.TestSideButton(w.NativeHandle(), back) })
+	return ok
+}
+
+func drag(w *mygo.Window, points [][2]float64) bool {
+	mygo.RunOnMain(func() { darwin.TestDrag(w.NativeHandle(), points) })
 	return true
 }
 
@@ -80,6 +108,10 @@ func trafficLights(w *mygo.Window) (x, y float64, supported bool) {
 	return x, y, true
 }
 
+func setWindowAppearance(w *mygo.Window, dark bool) {
+	mygo.RunOnMain(func() { darwin.TestSetWindowAppearance(w.NativeHandle(), dark) })
+}
+
 // Frameless windows keep native resize borders here.
 func movePointer(int, int) bool                { return false }
 func pressButton(bool) bool                    { return false }
@@ -98,8 +130,35 @@ func pressTitleButton(*mygo.Window, string) bool { return false }
 
 func topNonClient(*mygo.Window) (int32, int32, bool) { return 0, 0, false }
 
+func titleButtonColor(*mygo.Window, string) (uint8, uint8, uint8, bool) { return 0, 0, 0, false }
+
+// AppKit composes the window: there is no redirection bitmap to go without.
+func composition(*mygo.Window) (bool, bool, bool) { return false, false, false }
+func loseComposition(bool) bool                   { return false }
+
+// WebKit creates web views with their windows.
+func failWebViews(int) bool { return false }
+
 func clickAndType(w *mygo.Window, x, y float64, text string) (ok bool) {
 	mygo.RunOnMain(func() { ok = darwin.TestClickAndType(w.NativeHandle(), x, y, text) })
+	return ok
+}
+
+// pressKey presses the key of a virtual key code in a window of native UI,
+// through the input method.
+func pressKey(w *mygo.Window, code uint16, chars string) (ok bool) {
+	mygo.RunOnMain(func() { ok = darwin.TestKey(w.NativeHandle(), code, chars) })
+	return ok
+}
+
+// AppKit routes a drag to the view under the pointer, which
+// dropFiles, dropping on the content's, skips.
+func dragFiles(*mygo.Window, float64, float64, []string) (bool, bool) { return false, false }
+
+// pressTab presses Tab in a window of native UI, with Shift when back, as
+// the keyboard does: in the content or in the page of a web view.
+func pressTab(w *mygo.Window, back bool) (ok bool) {
+	mygo.RunOnMain(func() { ok = darwin.TestKeyShift(w.NativeHandle(), 48, "\t", back) })
 	return ok
 }
 
@@ -131,6 +190,9 @@ func dropFiles(w *mygo.Window, x, y float64, paths []string) (over, dropped, ok 
 // The roles of elements in the accessibility API of AppKit.
 const roleText, roleButton, roleCheckBox, roleTextField, roleSlider = "AXStaticText", "AXButton", "AXCheckBox", "AXTextField", "AXSlider"
 
+// roleListItem is the role of the rows of a List.
+const roleListItem = "AXRow/AXTableRow"
+
 func accessibility(w *mygo.Window) (nodes []accessNode, ok bool) {
 	mygo.RunOnMain(func() {
 		for _, n := range darwin.TestAccessibility(w.NativeHandle()) {
@@ -144,15 +206,42 @@ func accessibility(w *mygo.Window) (nodes []accessNode, ok bool) {
 	return nodes, true
 }
 
+// axAttribute reads an attribute of an element through AppKit's older
+// accessibility API, which only macOS has.
+func axAttribute(w *mygo.Window, label, attr string) (value string, settable, named, ok bool) {
+	mygo.RunOnMain(func() { value, settable, named, ok = darwin.TestAccessibilityAttribute(w.NativeHandle(), label, attr) })
+	return value, settable, named, ok
+}
+
 func accessPerform(w *mygo.Window, label, action, value string) (ok bool) {
 	mygo.RunOnMain(func() { ok = darwin.TestAccessibilityPerform(w.NativeHandle(), label, action, value) })
 	return ok
 }
 
-// Only Linux draws native UI in a GtkGLArea.
+// observe has key-value observing watch the view of a window showing
+// native UI and its elements, until stop.
+func observe(w *mygo.Window) (stop func(), supported bool) {
+	var end func()
+	mygo.RunOnMain(func() { end = darwin.TestObserve(w.NativeHandle()) })
+	return func() { mygo.RunOnMain(end) }, true
+}
+
+// Only Linux draws native UI in a GtkGLArea, nor waits to load the GPU's
+// driver.
 func glSurface(*mygo.Window) (string, []byte, int, int, bool) { return "", nil, 0, 0, false }
+func memoryUI(*testing.T) bool                                { return false }
+func surfaceOnScreen(*mygo.Window) ([]byte, bool)             { return nil, false }
+
+// Only Windows reads the screen over native UI.
+func screenColor(*mygo.Window, float64, float64) (uint8, uint8, uint8, bool) { return 0, 0, 0, false }
 
 // Context menus are not automated on macOS: one shown waits for the user.
 func rightClick(*mygo.Window, float64, float64) bool { return false }
 func popupMenus() ([][]string, bool)                 { return nil, false }
 func choosePopupItem(string) bool                    { return false }
+
+// pressEscape presses Escape in the key window, as the keyboard does.
+func pressEscape(*mygo.Window) bool {
+	mygo.RunOnMain(func() { darwin.TestAppKey(53, "\x1b") })
+	return true
+}

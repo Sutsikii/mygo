@@ -6,9 +6,11 @@ import (
 	"image"
 	"image/png"
 	"math"
+	"slices"
 
 	"github.com/egoist/mygo/internal/platform"
 	"github.com/egoist/mygo/internal/surface"
+	"github.com/egoist/mygo/transfer"
 )
 
 // Content is what a window shows in place of a web page: a user interface
@@ -29,9 +31,11 @@ func (w *Window) attachContent() {
 		panic("mygo: the backend " + backend().Name() + " created no surface for the window's Content")
 	}
 	w.conn = &surface.Conn{
-		Surface:   s,
-		Window:    w,
-		Clipboard: backend().Clipboard(),
+		Surface:        s,
+		Window:         w,
+		Clipboard:      backend().Clipboard(),
+		StartDataDrag:  w.startDataDrag,
+		CancelDataDrag: w.cancelDataDrag,
 		StartDrag: func() {
 			if w.native != nil {
 				w.native.StartDrag()
@@ -42,7 +46,9 @@ func (w *Window) attachContent() {
 				w.native.TitleBarDoubleClicked()
 			}
 		},
+		Escape:        w.escape,
 		IsDark:        func() bool { return backend().Theme().IsDark() },
+		Preferences:   func() platform.Preferences { return backend().Theme().Preferences() },
 		UIFont:        func() string { return backend().Theme().UIFont() },
 		FontRendering: func() platform.FontRendering { return backend().Theme().FontRendering() },
 		TitleBar: func() platform.TitleBar {
@@ -51,8 +57,31 @@ func (w *Window) attachContent() {
 			}
 			return w.native.TitleBar()
 		},
-		OpenURL:    func(url string) { go Shell.OpenExternal(url) },
+		OpenURL: func(url string, done func(error)) {
+			// The system may take a while, as Windows' shell does: not
+			// in the frame.
+			go func() {
+				err := Shell.OpenExternal(url)
+				if done != nil {
+					postMain(func() {
+						if w.native != nil {
+							done(err)
+						}
+					})
+				}
+			}()
+		},
+		DevTools:   w.devTools,
 		Invalidate: w.Invalidate,
+		Ready:      w.readyToShow,
+		Post: func(fn func()) {
+			postMain(func() {
+				if w.native != nil {
+					fn()
+				}
+			})
+		},
+		PlaceWebViews: w.placeWebViews,
 		PopupMenu: func(m *platform.Menu, x, y float64, chosen func(int)) {
 			pos := &platform.Point{X: int(math.Round(x)), Y: int(math.Round(y))}
 			menu := NewMenu(contentMenu(m, chosen))
@@ -122,9 +151,7 @@ func (w *Window) Invalidate() {
 	}
 	postMain(func() {
 		w.invalidating.Store(false)
-		if w.conn != nil && w.native != nil {
-			w.conn.Surface.RequestFrame()
-		}
+		w.contentChanged()
 	})
 }
 
@@ -141,10 +168,20 @@ func (w *Window) Invalidate() {
 func (w *Window) Update(fn func()) {
 	postMain(func() {
 		fn()
-		if w.conn != nil && w.native != nil {
-			w.conn.Surface.RequestFrame()
-		}
+		w.contentChanged()
 	})
+}
+
+// contentChanged asks the Content for a frame built anew, on the main
+// thread, after the app changed its state.
+func (w *Window) contentChanged() {
+	switch {
+	case w.conn == nil || w.native == nil:
+	case w.conn.Changed != nil:
+		w.conn.Changed()
+	default:
+		w.conn.Surface.RequestFrame()
+	}
 }
 
 // captureContent renders the Content into a PNG image.
@@ -177,12 +214,44 @@ func (w *Window) captureContent() ([]byte, error) {
 // SurfaceEvent passes the surface's events to the Content. Files the
 // Content does not take go to OnFileDrop, when it has listeners.
 func (h *windowHandler) SurfaceEvent(ev platform.SurfaceEvent) bool {
+	resolveDataDrag(ev.Drag)
 	c := h.w.conn
 	if c == nil || c.Event == nil {
 		return false
 	}
 	if c.Event(ev) {
 		return true
+	}
+	if d := ev.Drag; d != nil {
+		switch ev.Kind {
+		case platform.DataDragLeave:
+			c.Event(platform.SurfaceEvent{Kind: platform.FileDragLeave})
+		case platform.DataDragOver, platform.DataDrop:
+			if d.HasFiles || slices.Contains(d.Offer.Formats, transfer.FileList) {
+				d.Operation = transfer.Negotiate(d.Offer.Operations, transfer.Copy, d.Offer.Suggested)
+				if d.Operation == transfer.None {
+					return false
+				}
+				fileEvent := platform.SurfaceEvent{Kind: platform.FileDragOver, X: ev.X, Y: ev.Y}
+				if ev.Kind == platform.DataDrop {
+					fileEvent.Kind = platform.FileDrop
+					paths := ev.Files
+					if len(paths) == 0 {
+						paths, _ = d.Data.Files()
+					}
+					if len(paths) == 0 {
+						d.Operation = transfer.None
+						return false
+					}
+					fileEvent.Files = paths
+				}
+				d.Formats = []transfer.Format{transfer.FileList}
+				if h.SurfaceEvent(fileEvent) {
+					return true
+				}
+			}
+		}
+		d.Operation = transfer.None
 	}
 	switch ev.Kind {
 	case platform.FileDragOver:

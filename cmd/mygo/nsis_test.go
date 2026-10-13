@@ -53,7 +53,7 @@ func TestWindowsInstaller(t *testing.T) {
 		t.Fatal(err)
 	}
 	setup := artifacts[len(artifacts)-1]
-	if filepath.Base(setup) != "Setup Test Setup 2.0.0.exe" {
+	if filepath.Base(setup) != "Setup Test Setup 2.0.0 amd64.exe" {
 		t.Fatalf("artifacts = %q", artifacts)
 	}
 	// The executable, the uninstaller that makensis made, then the
@@ -63,7 +63,7 @@ func TestWindowsInstaller(t *testing.T) {
 	for _, line := range strings.Split(strings.TrimSpace(string(listed)), "\n") {
 		signed = append(signed, filepath.Base(strings.Trim(line, "\r \"")))
 	}
-	if len(signed) != 3 || signed[0] != "Setup Test.exe" || signed[1] == signed[0] || signed[1] == signed[2] || signed[2] != "Setup Test Setup 2.0.0.exe" {
+	if len(signed) != 3 || signed[0] != "Setup Test.exe" || signed[1] == signed[0] || signed[1] == signed[2] || signed[2] != "Setup Test Setup 2.0.0 amd64.exe" {
 		t.Errorf("signed %q", signed)
 	}
 	if runtime.GOOS != "windows" || runtime.GOARCH != "amd64" {
@@ -122,14 +122,15 @@ func TestWindowsInstaller(t *testing.T) {
 }
 
 // uninstall runs the uninstaller of the app installed in dir silently, and
-// waits until the app is gone.
+// waits until it is done.
 func uninstall(t *testing.T, dir string) {
 	t.Helper()
 	if out, err := exec.Command(filepath.Join(dir, "Uninstall.exe"), "/S").CombinedOutput(); err != nil {
 		t.Fatalf("uninstalling: %v\n%s", err, out)
 	}
-	// The uninstaller copies itself away and runs from there.
-	deadline := time.Now().Add(10 * time.Second)
+	// The uninstaller copies itself away and runs from there, and removes
+	// the app's folder last.
+	deadline := time.Now().Add(30 * time.Second)
 	for {
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
 			return

@@ -1,10 +1,17 @@
 package platform
 
+import (
+	"github.com/egoist/mygo/transfer"
+	"image"
+)
+
 // Surface is the drawing area of a window created with
 // WindowOptions.Surface, which shows content MyGo draws itself (package
 // ui) instead of a webview. Its methods run on the main thread.
 type Surface interface {
-	// Native returns the native objects a GPU renderer draws into.
+	// Native returns the native objects a GPU renderer draws into, which it
+	// calls before making one: a surface that shows frames drawn in memory
+	// through those objects (Windows' Composed) lets go of them then.
 	Native() SurfaceNative
 	// Size returns the size of the drawing area in DIPs and how many
 	// device pixels a DIP is.
@@ -13,6 +20,9 @@ type Surface interface {
 	// to draw: the next display refresh, WM_PAINT or GTK draw. Requests
 	// made before it comes coalesce.
 	RequestFrame()
+	// RefreshRate returns how many times a second the display showing the
+	// surface refreshes, at most, 0 when unknown.
+	RefreshRate() float64
 	// PresentPixels shows a frame drawn in memory: premultiplied BGRA rows
 	// of stride bytes, width×height device pixels. It is called while
 	// handling a SurfaceFrame event.
@@ -27,6 +37,64 @@ type Surface interface {
 	// elements. The content calls it after every frame once the surface
 	// sent AccessibilityOn.
 	UpdateAccessibility(tree *AccessTree)
+	// StartDataDrag starts a native transfer; CancelDataDrag cancels the
+	// source owned by this surface. Both run on the main thread.
+	StartDataDrag(DragRequest)
+	CancelDataDrag()
+	// SetDropFormats registers the formats the content can receive.
+	SetDropFormats([]transfer.Format)
+	// NewWebView creates a web view under the surface, hidden until
+	// PlaceWebViews shows it. Of opts, the options of a webview apply
+	// (UserScripts, Schemes, DevTools, UserAgent, Zoom, BackgroundColor,
+	// Transparent); h hears of its page.
+	NewWebView(opts *WindowOptions, h WindowHandler) (WebView, error)
+	// PlaceWebViews shows the web views of the surface where the content's
+	// last frame shows them, in the order it painted them, and hides the
+	// others, which keep their pages. A press on one, which takes it,
+	// comes as WebViewPress.
+	PlaceWebViews(views []WebViewPlacement)
+}
+
+// DamageSurface is a Surface that shows a frame drawn in memory by what
+// changed since the last one: Linux's, whose toolkit then repaints, and
+// the compositor takes, only that.
+type DamageSurface interface {
+	// PresentDamage is PresentPixels for a frame that differs from the
+	// last one presented only within damage, in device pixels.
+	PresentDamage(pix []byte, stride, width, height int, damage []image.Rectangle)
+}
+
+// OccludableSurface is a Surface that tells when nothing of it shows, as
+// when other windows cover its window, while the system may still give it
+// frames: the content then draws nothing that moves until it shows again.
+type OccludableSurface interface {
+	// Occluded reports whether nothing of the surface shows on screen. The
+	// surface sends SurfaceShown once some of it shows again.
+	Occluded() bool
+}
+
+// WideGamutSurface is a Surface that tells whether its window's screen
+// shows colors outside the sRGB gamut (macOS's).
+type WideGamutSurface interface {
+	// WideGamut reports whether the screen showing most of the window
+	// shows colors outside the sRGB gamut, as Display P3 screens do.
+	WideGamut() bool
+}
+
+// MaterialSurface is a Surface whose window can show a material
+// (vibrancy) behind the content, wherever its frames are transparent.
+type MaterialSurface interface {
+	// ShowsMaterial reports whether the window shows a material behind the
+	// content now: what its frames leave transparent shows it, rather than
+	// nothing.
+	ShowsMaterial() bool
+}
+
+// IdleSurface is a Surface that can give back memory once frames stop.
+type IdleSurface interface {
+	// Idle tells that no frame came for a while: the surface may give
+	// back memory that drawing frames took and freed.
+	Idle()
 }
 
 // TextInputState is the state of the text input that has the keyboard,
@@ -42,22 +110,39 @@ type TextInputState struct {
 	// of macOS's press and hold replace the letter they decorate.
 	Text       string
 	Start, End int
+	// Client supplies full text and geometry for a custom text element. The
+	// Text/Start/End snapshot remains the plain-widget and TextCaret fallback.
+	Client TextInputClient
 }
 
 // SurfaceNative holds the native objects of a Surface.
 type SurfaceNative struct {
 	// HWND is the surface's child window (Windows).
 	HWND uintptr
+	// Composed tells that the window has no redirection bitmap, which
+	// would hide its material (Windows): a GPU renderer presents through
+	// DirectComposition, with the frames' alpha, which the material shows
+	// through.
+	Composed bool
 	// View is the surface's NSView and Layer its layer (macOS).
 	View, Layer uintptr
 	// Widget is the surface's GtkGLArea or GtkDrawingArea, and GLArea the
 	// GtkGLArea while its render signal draws a frame with OpenGL, in the
 	// context it made current (Linux).
 	Widget, GLArea uintptr
+	// Canvas is the number of the canvas's WebGL 2 context (package gl's
+	// Context.ID), current while SurfaceFrame events are handled
+	// (browsers).
+	Canvas uintptr
 }
 
 // RectF is a rectangle in DIPs with fractional coordinates.
 type RectF struct{ X, Y, W, H float64 }
+
+// Contains reports whether the point is inside r.
+func (r RectF) Contains(x, y float64) bool {
+	return x >= r.X && y >= r.Y && x < r.X+r.W && y < r.Y+r.H
+}
 
 // SurfaceEventKind is the kind of a SurfaceEvent.
 type SurfaceEventKind uint8
@@ -82,6 +167,9 @@ const (
 	// auto-repeat.
 	KeyPressed
 	KeyReleased
+	// ModifiersChanged reports the modifier keys held, Mods, as one of
+	// them goes down or up on its own.
+	ModifiersChanged
 	// TextInput inserts Text, typed or committed by an input method.
 	TextInput
 	// TextComposition shows Text as the input method's composition, its
@@ -108,6 +196,28 @@ const (
 	// AccessAction performs Action on the element ID of the accessibility
 	// tree, with Text the value of AccessSetValue.
 	AccessAction
+	// SurfaceShown reports that some of an OccludableSurface shows again
+	// after none did.
+	SurfaceShown
+	// DataDragOver queries a destination; DataDrop commits a transfer.
+	// DataDragLeave clears its hover state. Drag carries the query/result.
+	DataDragOver
+	DataDragLeave
+	DataDrop
+	// SurfaceRenew reports that the native objects a GPU renderer draws
+	// into changed (Surface.Native), as a window of Windows composes its
+	// frames once it has web views: the content makes its renderer again.
+	SurfaceRenew
+	// WebViewPress reports that Button went down at X, Y on a web view
+	// the content shows there (Surface.PlaceWebViews), which takes the
+	// press and what follows: the content notes it, as popovers close for
+	// a press outside them, but handles none of it.
+	WebViewPress
+	// WebViewTabOut reports that Tab moved the keyboard out of WebView
+	// past its page's last element, or Shift+Tab (Mods) past its first:
+	// the surface has the keyboard again, and the content moves the focus
+	// on from the web view's element.
+	WebViewTabOut
 )
 
 // SurfaceEvent is input on a Surface, or a change of it.
@@ -123,20 +233,28 @@ type SurfaceEvent struct {
 	DX, DY  float64
 	Precise bool
 	Key     Key
-	Mods    Modifiers
-	Repeat  bool
-	Text    string
-	Caret   int
+	// PhysicalKey is the key by its position on an ANSI US keyboard,
+	// whatever the active layout types; KeyUnknown where the backend does
+	// not report it. Key and PhysicalKey agree on a US layout.
+	PhysicalKey Key
+	Mods        Modifiers
+	Repeat      bool
+	Text        string
+	Caret       int
 	// Replace makes TextInput replace, and TextComposition compose over,
 	// the runes From to To of the last TextInputState.Text, instead of the
 	// selection.
 	Replace  bool
 	From, To int
-	// Files are the paths of FileDrop's files.
+	// Files are the paths of FileDrop's files, or original native paths
+	// for DataDrop's legacy file-listener fallback.
 	Files []string
+	Drag  *DataDragEvent
 	// ID and Action are AccessAction's.
 	ID     uint64
 	Action AccessActionKind
+	// WebView is WebViewTabOut's.
+	WebView WebView
 }
 
 // Modifiers are the modifier keys held during an event.
@@ -231,6 +349,10 @@ const (
 	KeyX
 	KeyY
 	KeyZ
+	// KeyBack and KeyForward go back and forward in a history: the side
+	// buttons of a mouse, and the keys of keyboards that have them.
+	KeyBack
+	KeyForward
 )
 
 // KeyForRune returns the key typing r unshifted, KeyUnknown for others.
@@ -270,6 +392,35 @@ func KeyForRune(r rune) Key {
 		return KeySpace
 	}
 	return KeyUnknown
+}
+
+// scancodeKeys maps the scancodes of the letter, digit and punctuation keys
+// of an ANSI US keyboard to the key at that position. The main block's
+// codes are the same in Linux's evdev and in XT set 1, which Windows
+// reports.
+var scancodeKeys = map[uint16]Key{
+	2: Key1, 3: Key2, 4: Key3, 5: Key4, 6: Key5, 7: Key6, 8: Key7, 9: Key8, 10: Key9, 11: Key0,
+	12: KeyMinus, 13: KeyEqual,
+	16: KeyQ, 17: KeyW, 18: KeyE, 19: KeyR, 20: KeyT, 21: KeyY, 22: KeyU, 23: KeyI, 24: KeyO, 25: KeyP,
+	26: KeyBracketLeft, 27: KeyBracketRight,
+	30: KeyA, 31: KeyS, 32: KeyD, 33: KeyF, 34: KeyG, 35: KeyH, 36: KeyJ, 37: KeyK, 38: KeyL,
+	39: KeySemicolon, 40: KeyQuote, 41: KeyBackquote, 43: KeyBackslash,
+	44: KeyZ, 45: KeyX, 46: KeyC, 47: KeyV, 48: KeyB, 49: KeyN, 50: KeyM,
+	51: KeyComma, 52: KeyPeriod, 53: KeySlash,
+}
+
+// KeyForScancode returns the key at a scancode's position on an ANSI US
+// keyboard, whatever the layout types (SurfaceEvent.PhysicalKey), or
+// KeyUnknown for a key it does not map. A scancode is Linux's evdev code
+// (the X keycode less 8) or Windows's XT set 1 code without the extended
+// flag.
+func KeyForScancode(code uint16) Key { return scancodeKeys[code] }
+
+// KeyByPosition reports whether a key press whose layout key is key may
+// stand for its physical key: only when the layout types no US key, and a
+// shortcut modifier is held, so that typing stays on the layout.
+func KeyByPosition(key, physical Key, mods Modifiers) bool {
+	return key == KeyUnknown && physical != KeyUnknown && mods&(ModCtrl|ModAlt|ModSuper) != 0
 }
 
 // Cursor is a pointer shape.

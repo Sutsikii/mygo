@@ -1,3 +1,5 @@
+//go:build !js
+
 package mygo
 
 import (
@@ -7,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -25,6 +26,7 @@ import (
 
 	"github.com/egoist/mygo/internal/fake"
 	"github.com/egoist/mygo/internal/platform"
+	"github.com/egoist/mygo/transfer"
 )
 
 var fb *fake.Backend
@@ -34,9 +36,11 @@ var fb *fake.Backend
 func TestMain(m *testing.M) {
 	if os.Getenv("MYGO_TEST_SECOND_INSTANCE") == "1" {
 		// Helper process for TestSingleInstance.
+		packageIdentifier = os.Getenv("MYGO_TEST_IDENTIFIER")
 		App.SetName("MyGoTest")
 		if App.RequestSingleInstanceLock() {
 			fmt.Println("locked")
+			releaseSingleInstanceLock()
 		} else {
 			fmt.Println("forwarded")
 		}
@@ -336,7 +340,65 @@ func TestWillNavigate(t *testing.T) {
 	check(platform.Navigation{URL: "https://ok.example", IsMainFrame: true}, true)
 	check(platform.Navigation{URL: "https://blocked.example", IsMainFrame: true}, false)
 	check(platform.Navigation{URL: "https://blocked.example", IsMainFrame: false}, true)
-	check(platform.Navigation{URL: "https://blocked.example", IsMainFrame: true, IsReload: true}, true)
+	check(platform.Navigation{URL: "https://blocked.example", IsMainFrame: true, Unasked: true}, true)
+}
+
+// TestReloadLoadsHTMLAgain checks that a reload of a document LoadHTML
+// loaded loads it again, where web views would reload its URL.
+func TestReloadLoadsHTMLAgain(t *testing.T) {
+	w, fw := testWindow(t, WindowOptions{})
+	commit := func(url string) { onMain(func() { fw.H.NavigationCommitted(url) }) }
+	reloads := func(url string) bool {
+		t.Helper()
+		nav := platform.Navigation{URL: url, IsMainFrame: true, Unasked: true, Reload: true}
+		went := onMainValue(func() bool { return fw.H.WillNavigate(nav) })
+		onMain(func() {}) // what the reload posted
+		return went
+	}
+	loaded := func(want ...string) {
+		t.Helper()
+		if got := onMainValue(func() []string { return slices.Clone(fw.HTML) }); !slices.Equal(got, want) {
+			t.Errorf("LoadHTML loaded %q, want %q", got, want)
+		}
+	}
+
+	w.Page().LoadHTML("one", "")
+	if !reloads("https://previous.example/") {
+		t.Error("the reload of the previous page was canceled")
+	}
+	commit("about:blank")
+	if reloads("about:blank") {
+		t.Error("the reload of the HTML went ahead")
+	}
+	commit("about:blank")
+	if reloads("about:blank#x") {
+		t.Error("the reload of the HTML after a fragment navigation went ahead")
+	}
+	loaded("one", "one", "one")
+	// Until it commits, a reload is the previous document's.
+	if !reloads("about:blank") {
+		t.Error("a reload before the HTML committed was canceled")
+	}
+	commit("about:blank")
+	commit("https://next.example/")
+	if !reloads("https://next.example/") {
+		t.Error("the reload of the next page was canceled")
+	}
+	loaded("one", "one", "one")
+
+	w.Page().LoadHTML("two", "mygo://localhost")
+	commit("mygo://localhost/")
+	if reloads("mygo://localhost/") {
+		t.Error("the reload of the HTML at its base URL went ahead")
+	}
+	loaded("one", "one", "one", "two", "two")
+	commit("mygo://localhost/")
+	if err := w.Page().LoadURL("https://next.example/"); err != nil {
+		t.Fatal(err)
+	}
+	if !reloads("mygo://localhost/") {
+		t.Error("a reload after LoadURL was canceled")
+	}
 }
 
 func TestReadyToShowFiresOnce(t *testing.T) {
@@ -963,10 +1025,10 @@ type recorder struct {
 	finished chan struct{}
 }
 
-func (r *recorder) Respond(status int, h http.Header) { r.status, r.header = status, h }
-func (r *recorder) Write(p []byte)                    { r.body.Write(p) }
-func (r *recorder) Finish()                           { close(r.finished) }
-func (r *recorder) Fail(err error)                    { r.body.WriteString("FAIL " + err.Error()); close(r.finished) }
+func (r *recorder) Respond(status int, h map[string][]string) { r.status, r.header = status, h }
+func (r *recorder) Write(p []byte)                            { r.body.Write(p) }
+func (r *recorder) Finish()                                   { close(r.finished) }
+func (r *recorder) Fail(err error)                            { r.body.WriteString("FAIL " + err.Error()); close(r.finished) }
 
 func request(t *testing.T, fw *fake.Window, method, url string, body io.Reader) *recorder {
 	t.Helper()
@@ -1365,7 +1427,7 @@ func TestMenuRolesAndState(t *testing.T) {
 	mu.Unlock()
 
 	menu.ItemByID("new").SetEnabled(false)
-	time.Sleep(20 * time.Millisecond)
+	onMain(func() {}) // the update reaches the backend on the main thread
 	updates := fb.MenuUpdates()
 	last := updates[len(updates)-1]
 	if last.ID != menu.ItemByID("new").uid || last.Enabled {
@@ -1399,6 +1461,66 @@ func TestMenuRolesOnWindow(t *testing.T) {
 	onMain(func() { performRole(RoleToggleDevTools, w) })
 	if !w.Page().IsDevToolsOpened() {
 		t.Error("toggleDevTools")
+	}
+}
+
+func TestWindowMenuActivation(t *testing.T) {
+	w, fw := testWindow(t, WindowOptions{Hidden: true})
+	other, otherNative := testWindow(t, WindowOptions{Hidden: true})
+	other.Focus()
+	var clicked *Window
+	var checked bool
+	var zoom float64
+	clicks := 0
+	menu := NewMenu([]*MenuItem{{Label: "View", Submenu: []*MenuItem{
+		{ID: "small", Label: "Small", Type: MenuItemRadio, Checked: true},
+		{ID: "large", Label: "Large", Type: MenuItemRadio, Role: RoleZoomIn, Click: func(it *MenuItem, win *Window) {
+			clicked, checked = win, it.IsChecked()
+			if win != nil {
+				zoom = win.Page().ZoomFactor()
+			}
+			clicks++
+		}},
+	}}})
+	item := menu.ItemByID("large")
+	onMain(func() { fw.ClickMenuItem(item.uid) })
+	if clicked != w || !checked || zoom != 1.1 || menu.ItemByID("small").IsChecked() {
+		t.Errorf("click = (%v, checked %v, zoom %v), want the menu's window after its state and role changed", clicked, checked, zoom)
+	}
+	if other.Page().ZoomFactor() != 1 {
+		t.Error("the role changed the focused window instead of the menu's window")
+	}
+	if FocusedWindow() != other {
+		t.Error("choosing a menu item changed window focus")
+	}
+
+	// A submenu taking focus clears FocusedWindow; its owner still applies.
+	onMain(otherNative.Blur)
+	if FocusedWindow() != nil {
+		t.Fatal("a window still has focus")
+	}
+	onMain(func() { fw.ClickMenuItem(item.uid) })
+	if clicked != w || zoom != 1.25 {
+		t.Errorf("click without focus = (%v, zoom %v), want the menu's window", clicked, zoom)
+	}
+
+	// Application and tray menus without a window use the focused window.
+	other.Focus()
+	onMain(func() { fb.ClickMenuItem(item.uid) })
+	if clicked != other || zoom != 1.1 {
+		t.Errorf("application click = (%v, zoom %v), want the focused window", clicked, zoom)
+	}
+	onMain(otherNative.Blur)
+	onMain(func() { fb.ClickMenuItem(item.uid) })
+	if clicked != nil {
+		t.Error("a menu without a window supplied one while none had focus")
+	}
+
+	w.Destroy()
+	before := clicks
+	onMain(func() { fw.ClickMenuItem(item.uid) })
+	if clicks != before {
+		t.Error("a destroyed window still delivered a menu click")
 	}
 }
 
@@ -1527,6 +1649,13 @@ var needsAppCalls = []struct {
 	{"Clipboard.WriteImage", func() { Clipboard.WriteImage(nil) }},
 	{"Clipboard.Clear", func() { Clipboard.Clear() }},
 	{"Clipboard.AvailableFormats", func() { Clipboard.AvailableFormats() }},
+	{"Clipboard.Write", func() { Clipboard.Write(transfer.Data{}) }},
+	{"Clipboard.Read", func() { Clipboard.Read() }},
+	{"Clipboard.Formats", func() { Clipboard.Formats() }},
+	{"Clipboard.ReadFormat", func() { Clipboard.ReadFormat(transfer.Text) }},
+	{"Clipboard.ReadFiles", func() { Clipboard.ReadFiles() }},
+	{"Clipboard.WriteFiles", func() { Clipboard.WriteFiles() }},
+	{"Clipboard.Flush", func() { Clipboard.Flush() }},
 	{"Screen.Displays", func() { Screen.Displays() }},
 	{"Screen.PrimaryDisplay", func() { Screen.PrimaryDisplay() }},
 	{"Screen.CursorScreenPoint", func() { Screen.CursorScreenPoint() }},
@@ -1551,6 +1680,9 @@ var needsAppCalls = []struct {
 // do before Run, when the backend is not initialized, and what it may
 // not, then exits.
 func beforeRun() {
+	// An event for a frontend, as an app of one declares, so that generate
+	// mode has a client to write.
+	NewEvent[int]("test:before-run")
 	// Settings, which Run applies.
 	Theme.SetSource(ThemeDark)
 	App.Dock.SetMenu(NewMenu([]*MenuItem{{Label: "New Window"}}))
@@ -1559,6 +1691,9 @@ func beforeRun() {
 	Power.IsOnBattery()
 	GlobalShortcut.UnregisterAll()
 	NewNotification(NotificationOptions{}).Close()
+	// Nothing can be shown before Run, so there is nothing to clear and
+	// no backend to ask.
+	ClearNotifications()
 	for _, c := range needsAppCalls {
 		func() {
 			defer func() { fmt.Printf("%s: %v\n", c.name, recover()) }()
@@ -1636,6 +1771,23 @@ func TestGlobalShortcut(t *testing.T) {
 	}
 }
 
+// TestNotificationShowFails: Show returns what the backend answers, and
+// forgets a notification it could not show, which nothing will click.
+func TestNotificationShowFails(t *testing.T) {
+	onMain(func() { fb.NotificationError = ErrNotificationsDenied })
+	t.Cleanup(func() { onMain(func() { fb.NotificationError = nil }) })
+	n := NewNotification(NotificationOptions{Title: "Export finished"})
+	if err := n.Show(); !errors.Is(err, ErrNotificationsDenied) {
+		t.Errorf("Show = %v", err)
+	}
+	notifications.Lock()
+	_, kept := notifications.byID[n.id]
+	notifications.Unlock()
+	if kept {
+		t.Error("the notification is kept")
+	}
+}
+
 func TestParseColor(t *testing.T) {
 	rgba := func(r, g, b, a uint8) platform.Color { return platform.Color{R: r, G: g, B: b, A: a} }
 	tests := map[string]platform.Color{
@@ -1696,6 +1848,24 @@ func TestEncodeReply(t *testing.T) {
 	}
 }
 
+// TestSingleInstanceIdentifier checks that an app with another identifier
+// but the same name, as the development app of mygo dev that calls SetName,
+// does not hand over to the running one.
+func TestSingleInstanceIdentifier(t *testing.T) {
+	if !App.RequestSingleInstanceLock() {
+		t.Fatal("first instance did not get the lock")
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	cmd.Env = append(os.Environ(), "MYGO_TEST_SECOND_INSTANCE=1", "MYGO_TEST_IDENTIFIER=com.example.mygotest.dev")
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(out)) != "locked" {
+		t.Fatalf("an app with another identifier printed %q", out)
+	}
+}
+
 func TestSingleInstance(t *testing.T) {
 	if !App.RequestSingleInstanceLock() {
 		t.Fatal("first instance did not get the lock")
@@ -1739,53 +1909,5 @@ func TestSingleInstance(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("OnOpenURL not called for the forwarded URL")
-	}
-}
-
-func TestDevReadySignal(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("unix sockets only")
-	}
-	dir, err := os.MkdirTemp("", "mygo")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-	sock := filepath.Join(dir, "ready.sock")
-	ln, err := net.Listen("unix", sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	onMain(func() {
-		devReady.socket = sock
-		devReady.once = sync.Once{}
-	})
-	defer onMain(func() { devReady.socket = "" })
-
-	accepted := make(chan string, 1)
-	go func() {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		defer conn.Close()
-		msg, _ := io.ReadAll(conn)
-		accepted <- string(msg)
-	}()
-	_, fw := testWindow(t, WindowOptions{})
-	select {
-	case <-accepted:
-		t.Fatal("ready before the page loaded")
-	case <-time.After(50 * time.Millisecond):
-	}
-	page(fw, `{"t":"dom-ready"}`)
-	select {
-	case msg := <-accepted:
-		if msg != "ready\n" {
-			t.Errorf("ready message = %q", msg)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("the app did not report ready")
 	}
 }

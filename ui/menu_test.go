@@ -14,10 +14,10 @@ func TestContextMenu(t *testing.T) {
 		locked       = true
 		rightClicked int
 	)
-	view := func(c *Context) {
-		Column(c).Fill().Padding(20).Gap(10).Children(func() {
-			row := Row(c).Padding(8).Children(func() {
-				Text(c, "Report.pdf")
+	view := func(c *context) {
+		coreColumn(c).Fill().Padding(20).Gap(10).Children(func() {
+			row := coreRow(c).Padding(8).Children(func() {
+				coreText(c, "Report.pdf")
 			})
 			row.ContextMenu(func(m *Menu) {
 				if m.Item("Open").Shortcut(Cmd, KeyO).Chosen() {
@@ -39,13 +39,13 @@ func TestContextMenu(t *testing.T) {
 				}
 			})
 			// Without a context menu, a right-click is the box's.
-			if Box(c).Size(60, 30).Label("plain").RightClicked() {
+			if coreBox(c).Size(60, 30).Label("plain").RightClicked() {
 				rightClicked++
 			}
-			Text(c, map[bool]string{false: "loose", true: "pinned"}[pinned])
+			coreText(c, map[bool]string{false: "loose", true: "pinned"}[pinned])
 		})
 	}
-	tt := NewTester(view, 400, 300)
+	tt := coreNewTester(view, 400, 300)
 	if tt.Menu() != nil {
 		t.Fatalf("a menu shows before any click: %q", tt.Menu())
 	}
@@ -111,10 +111,10 @@ func TestContextMenu(t *testing.T) {
 
 func TestInnermostContextMenu(t *testing.T) {
 	var got string
-	view := func(c *Context) {
-		card := Column(c).Padding(20).Children(func() {
-			Text(c, "Card")
-			Button(c, "Share").ContextMenu(func(m *Menu) {
+	view := func(c *context) {
+		card := coreColumn(c).Padding(20).Children(func() {
+			coreText(c, "Card")
+			coreButton(c, "Share").ContextMenu(func(m *Menu) {
 				if m.Item("Copy Link").Chosen() {
 					got = "Copy Link"
 				}
@@ -126,7 +126,7 @@ func TestInnermostContextMenu(t *testing.T) {
 			}
 		})
 	}
-	tt := NewTester(view, 400, 300)
+	tt := coreNewTester(view, 400, 300)
 	tt.RightClick("Share")
 	if m := tt.Menu(); !slices.Equal(m, []string{"Copy Link"}) {
 		t.Fatalf("the button's menu is %q", m)
@@ -143,17 +143,17 @@ func TestInnermostContextMenu(t *testing.T) {
 
 func TestContextMenuFromTheKeyboard(t *testing.T) {
 	var chosen int
-	view := func(c *Context) {
-		Column(c).Padding(20).Gap(8).Children(func() {
-			Button(c, "First")
-			Button(c, "Second").ContextMenu(func(m *Menu) {
+	view := func(c *context) {
+		coreColumn(c).Padding(20).Gap(8).Children(func() {
+			coreButton(c, "First")
+			coreButton(c, "Second").ContextMenu(func(m *Menu) {
 				if m.Item("Duplicate").Chosen() {
 					chosen++
 				}
 			})
 		})
 	}
-	tt := NewTester(view, 400, 300)
+	tt := coreNewTester(view, 400, 300)
 	tt.Key(0, KeyTab)
 	tt.Key(0, KeyContextMenu)
 	if tt.Menu() != nil {
@@ -176,9 +176,9 @@ func TestContextMenuFromTheKeyboard(t *testing.T) {
 
 func TestTextInputContextMenu(t *testing.T) {
 	value := "hello world"
-	tt := NewTester(func(c *Context) {
-		Column(c).Padding(20).Children(func() {
-			TextInput(c, &value).Label("Name")
+	tt := coreNewTester(func(c *context) {
+		coreColumn(c).Padding(20).Children(func() {
+			coreTextInput(c, &value).Label("Name")
 		})
 	}, 400, 200)
 	r, ok := tt.Find("Name")
@@ -236,5 +236,110 @@ func TestAccelerator(t *testing.T) {
 		if got := accelerator(c.mods, c.key); got != c.want {
 			t.Errorf("accelerator(%v, %v) = %q, want %q", c.mods, c.key, got, c.want)
 		}
+	}
+}
+
+// sortView is a menu button choosing an order, with a button after it.
+type sortView struct {
+	sort     string
+	disabled bool
+}
+
+func (s *sortView) view(c *context) {
+	coreColumn(c).Padding(20).Gap(10).AlignItems(Start).Children(func() {
+		coreMenuButton(c, "Sort by", func(m *Menu) {
+			for _, by := range []string{"Name", "Date", "Size"} {
+				if m.Item(by).Checked(s.sort == by).Chosen() {
+					s.sort = by
+				}
+			}
+		}).Disabled(s.disabled)
+		coreButton(c, "Other")
+	})
+}
+
+func TestMenuButton(t *testing.T) {
+	s := &sortView{sort: "Name"}
+	tt := coreNewTester(s.view, 400, 300)
+	// The menu opens as the button goes down, below it.
+	r, _ := tt.Find("Sort by")
+	tt.Press(r.X+r.W/2, r.Y+r.H/2)
+	if got, want := tt.Menu(), []string{"Name", "Date", "Size"}; !slices.Equal(got, want) {
+		t.Fatalf("menu %q, want %q", got, want)
+	}
+	if at := tt.h.menuAt; at[0] > r.X || at[1] < r.Y+r.H || at[1] > r.Y+r.H+20 {
+		t.Errorf("the menu shows at %v, the label being at %v", at, r)
+	}
+	if !tt.h.menu.Items[0].Checked {
+		t.Error("Name is not checked")
+	}
+	tt.Release(r.X+r.W/2, r.Y+r.H/2)
+	if err := tt.ChooseMenuItem("Date"); err != nil {
+		t.Fatal(err)
+	}
+	if s.sort != "Date" || !tt.Focused("Sort by") {
+		t.Fatalf("chose %q; focused %v", s.sort, tt.Focused("Sort by"))
+	}
+	// The keys open it while it has the focus.
+	for _, k := range []Key{KeyEnter, KeySpace, KeyDown} {
+		tt.CloseMenu()
+		tt.Key(0, k)
+		if tt.Menu() == nil {
+			t.Errorf("%v does not open the menu", k)
+		}
+	}
+	tt.CloseMenu()
+	tt.Key(0, KeyTab)
+	tt.Key(0, KeyEnter)
+	if tt.Menu() != nil {
+		t.Error("Enter on the next button opens the menu")
+	}
+	s.disabled = true
+	tt.Frame()
+	tt.Click("Sort by")
+	if tt.Menu() != nil {
+		t.Error("a disabled menu button opens its menu")
+	}
+}
+
+func TestMenuButtonAccessibility(t *testing.T) {
+	s := &sortView{sort: "Name"}
+	tt := coreNewTester(s.view, 400, 300)
+	tt.send(platform.SurfaceEvent{Kind: platform.AccessibilityOn})
+	n := accessNode(t, tt.h.access, platform.RoleMenuButton, "Sort by")
+	if n.Actions&platform.ActionPress == 0 || n.States&platform.AccessFocusable == 0 {
+		t.Errorf("the menu button: %+v", n)
+	}
+	tt.send(platform.SurfaceEvent{Kind: platform.AccessAction, ID: n.ID, Action: platform.AccessPress})
+	if tt.Menu() == nil {
+		t.Error("pressing it does not open the menu")
+	}
+}
+
+func TestMenuAndContextMenuOfOneElement(t *testing.T) {
+	var chosen []string
+	tt := coreNewTester(func(c *context) {
+		coreBox(c).Size(100, 40).Label("Both").Menu(func(m *Menu) {
+			if m.Item("From the menu").Chosen() {
+				chosen = append(chosen, "menu")
+			}
+		}).ContextMenu(func(m *Menu) {
+			if m.Item("From the context menu").Chosen() {
+				chosen = append(chosen, "context")
+			}
+		})
+	}, 300, 200)
+	tt.Click("Both")
+	if got := tt.Menu(); !slices.Equal(got, []string{"From the menu"}) {
+		t.Fatalf("a click shows %q", got)
+	}
+	tt.ChooseMenuItem("From the menu")
+	tt.RightClick("Both")
+	if got := tt.Menu(); !slices.Equal(got, []string{"From the context menu"}) {
+		t.Fatalf("a right-click shows %q", got)
+	}
+	tt.ChooseMenuItem("From the context menu")
+	if !slices.Equal(chosen, []string{"menu", "context"}) {
+		t.Errorf("chose %q", chosen)
 	}
 }

@@ -1,8 +1,11 @@
 package ui
 
 import (
+	"math"
 	"math/bits"
+	"runtime"
 	"slices"
+	"strings"
 )
 
 // A List builds only the rows in view, and keeps its place by a row, its
@@ -33,6 +36,9 @@ const listSearch = 1000
 // knows of the heights of its rows, kept in the app's state. Give each
 // List a ListState of its own; set its fields before building the List.
 type ListState struct {
+	// Handle names this list independently of its per-pass node.
+	Handle
+
 	// Key returns an identity for the item row i shows, such as its ID:
 	// comparable, and unique among the rows. Without it, a row is its
 	// index. With it, the state of a row (focus, text being edited, …)
@@ -45,16 +51,48 @@ type ListState struct {
 	// to it follows again.
 	FollowEnd bool
 	// Selected, when set, lets a click choose a row, as Up, Down, Home and
-	// End do while the list has the keyboard focus: *Selected is the
-	// chosen row, -1 for none, which shows in the accent color. The list's
-	// Changed reports a new choice, and its Submitted a double click or
-	// Enter.
+	// End do while the list has the keyboard focus, and Page Up and Page
+	// Down on Linux and Windows: *Selected is the chosen row, -1 for none,
+	// which shows in the accent color. The list's Changed reports a new
+	// choice, and its Submitted a double click or Enter.
 	Selected *int
+	// Selection, when set, lets the user choose several rows, which it
+	// holds by their keys: a click chooses one, Cmd-click (Ctrl-click on
+	// Linux and Windows) adds a row or takes it out, and Shift-click
+	// chooses those from the row last chosen to it, as Shift with the keys
+	// that move the choice does; Cmd+A chooses all. On Linux and Windows,
+	// Ctrl with those keys moves without choosing, and Ctrl+Space adds the
+	// row there or takes it out. Selected, set as well, is the row last
+	// chosen, where the keys move from.
+	Selection Selector
+	// Label returns the text of row i: typing the first letters of a
+	// row's text while the list has the keyboard focus chooses it, and
+	// assistive technology reads it as the row's name.
+	Label func(row int) string
 	// Header, when set, reports whether row i heads a section: the header
 	// of the section at the top of the list stays there while the rows of
 	// its section scroll under it, until the next header pushes it away.
 	// Give headers a background. Headers are not chosen.
 	Header func(row int) bool
+	// Reorder, when set, lets the user drag rows to another place in the
+	// list: the rows chosen, when the row dragged is one, else that row,
+	// which the list passes in order, and the row they go before, the
+	// number of rows for the end. Move them there: the list shows where
+	// they would go as they are dragged, and scrolls near its edges.
+	Reorder func(rows []int, to int)
+	// Sort, when set, is the column a Table's rows are sorted by: a click
+	// on the header of a Sortable column sorts by it, ascending, and
+	// another reverses the order, which the header shows. Sort the rows as
+	// it says, when it changes.
+	Sort *SortOrder
+	// Columns keeps the order and the widths the user gave a Table's
+	// columns, by ID: restore it from saved settings, and save it as it
+	// changes.
+	Columns TableLayout
+	// RoundRows rounds the corners of a Table's chosen and hovered rows at
+	// the theme's Radius, as a List's are, rather than leaving them square
+	// from edge to edge.
+	RoundRows bool
 
 	// The place: the first row in view, and how far the list is scrolled
 	// past its top: the row's top is that far above where the content
@@ -85,11 +123,23 @@ type ListState struct {
 	// tell the app choosing another from rows moving.
 	selRow int
 	selKey any
+	// lead is the row last chosen in a list choosing several without
+	// Selected. Shift chooses the rows from pivot, whose key is pivotKey,
+	// and chose those from it to pivot+span last.
+	lead, pivot, span int
+	pivotKey          any
+
 	header listHeader
 	// rows are the last frame's rows by their elements' IDs, to find the
 	// row holding the focus.
 	rows  map[uint64]listRowID
 	frame listFrame
+	// editables reports rows holding an EditableText in the last frame,
+	// and editablesNow in this one; editKey is the row whose text the keys
+	// asked to edit, while editAsked.
+	editables, editablesNow bool
+	editKey                 any
+	editAsked               bool
 }
 
 // listRequest is where the app or the user asked the list to go: to row
@@ -144,31 +194,98 @@ func (s *ListState) AtEnd() bool {
 	return s.atEnd
 }
 
+// Focused reports whether the List, Table or Outline using s has
+// the keyboard focus. Call it from the view, after building the list or
+// while building its rows. It returns false when s was not built in the
+// current pass of c, including when the list is hidden.
+func (s *ListState) coreFocused(c *context) bool { return s.current(c).Focused() }
+
+// FocusWithin reports whether the list or one of its descendants has the
+// keyboard focus, with the same lifetime as Focused. Row builders can use
+// it before List returns, without saving an Element from an earlier frame.
+func (s *ListState) coreFocusWithin(c *context) bool { return s.current(c).FocusWithin() }
+
+// Focus gives the list the keyboard focus and reports whether it was
+// built in the current pass of c. A pending focus request can wait until
+// a hidden list returns:
+//
+//	if app.focusFiles && app.files.Focus(c) {
+//		app.focusFiles = false
+//	}
+//
+// Call it after building the list, or while building its rows.
+func (s *ListState) coreFocus(c *context) bool {
+	e := s.current(c)
+	if e == nil {
+		return false
+	}
+	e.Focus()
+	return true
+}
+
+// Shortcut reports whether mods+key was pressed while the list or one of
+// its descendants had the focus, as Element.Shortcut does. Call it after
+// building the list, or while building its rows. A list not built in the
+// current pass of c registers and handles no shortcuts.
+func (s *ListState) coreShortcut(c *context, mods Modifiers, key Key) bool {
+	return s.current(c).Shortcut(mods, key)
+}
+
+// current resolves the focus owner of this pass before reading an arena
+// pointer: an absent list's old slot may now hold an unrelated element.
+func (s *ListState) current(c *context) *node {
+	if s == nil || c == nil || c.rt == nil || c.rt.closed || !c.rt.inFrame {
+		return nil
+	}
+	f := &s.frame
+	if f.c != c || f.frame != c.rt.frame || f.pass != c.rt.pass {
+		return nil
+	}
+	return f.owner
+}
+
 // listFrame is what a List built in the frame, for laying it out.
 type listFrame struct {
-	c *Context
-	e *Element
+	c *context
+	e *node
 	// owner takes the focus and reports choices: the list, or its Table.
-	owner *Element
+	owner *node
 	s     *ListState
 	n     int
 	row   func(i int)
 	frame uint64
 	pass  int
-	// flat leaves the corners of chosen rows square, as a Table's.
-	flat bool
+	// flat leaves the corners of chosen rows square, as a Table's unless
+	// ListState.RoundRows; tree makes the rows items of a tree, as an
+	// Outline's.
+	flat, tree bool
+	// grid makes the rows those of a GridView, which holds its items.
+	grid bool
 	// theme is the theme the rows are built with, laying out as well.
 	theme *Theme
 	rows  []listRow
 	// at finds rows by their index while the list lays out.
 	at map[int]int
+	// rb is the row being built (Context.row), kept here rather than
+	// allocated for each row.
+	rb rowBuild
 }
 
 type listRow struct {
 	i   int
 	key any
-	e   *Element
+	e   *node
 	y   float64
+}
+
+// rowBuild is the row of a list being built, for what is inside it: its
+// list, index and key, whether it was chosen before a click on it in this
+// frame, and whether it was double-clicked.
+type rowBuild struct {
+	f                       *listFrame
+	i                       int
+	key                     any
+	clicked, chosen, double bool
 }
 
 // List creates a vertical scroll container of n rows, built with row(i),
@@ -187,33 +304,48 @@ type listRow struct {
 // chooses rows, and pins the headers of sections. Gap spaces the rows,
 // Padding pads the content, scrolling with it, and Justify(End) puts rows
 // that do not fill the list at its bottom, as a chat's first messages.
-func List(c *Context, s *ListState, n int, row func(i int)) *Element {
-	e := Scroll(c)
+func coreList(c *context, s *ListState, n int, row func(i int)) *node {
+	e := coreScroll(c)
 	e.widget, e.role = "List", RoleList
 	if s == nil {
-		s = Local(e, "list", func() ListState { return ListState{} })
+		s = coreLocal(e, "list", func() ListState { return ListState{} })
 	}
-	buildList(c, e, e, s, n, row, false)
+	buildList(c, e, e, s, n, row, plainList)
 	return e
 }
 
 // buildList builds the rows of list e that its place shows, with owner
 // taking the focus and reporting choices.
-func buildList(c *Context, e, owner *Element, s *ListState, n int, row func(i int), flat bool) {
+// listKind is what a list's rows are: a List's, a Table's, an
+// Outline's, or an OutlineTable's.
+type listKind uint8
+
+const (
+	plainList listKind = iota
+	tableList
+	treeList
+	treeTableList
+	// gridList's rows hold the items of a GridView.
+	gridList
+)
+
+func buildList(c *context, e, owner *node, s *ListState, n int, row func(i int), kind listKind) {
+	flat, tree := kind == tableList || kind == treeTableList, kind == treeList || kind == treeTableList
 	rt := c.rt
 	f := &s.frame
 	if f.e != nil && f.frame == rt.frame && f.pass == rt.pass {
 		panic("ui: a ListState shown by two Lists")
 	}
 	n = max(n, 0)
-	*f = listFrame{c: c, e: e, owner: owner, s: s, n: n, row: row, frame: rt.frame, pass: rt.pass, flat: flat, theme: c.theme, rows: f.rows[:0], at: f.at}
-	e.list = f
+	*f = listFrame{c: c, e: e, owner: owner, s: s, n: n, row: row, frame: rt.frame, pass: rt.pass, flat: flat, tree: tree, grid: kind == gridList, theme: c.theme, rows: f.rows[:0], at: f.at}
+	if rt.pass == 0 {
+		s.editables, s.editablesNow = s.editablesNow, false
+	}
+	e.list, owner.rowsOf = f, f
+	wrapElement(owner).Bind(&s.Handle)
 	s.sync(e, n)
-	if s.Selected != nil {
-		if owner == e {
-			e.Focusable()
-		}
-		f.navigate()
+	if s.cursor() != nil && owner == e {
+		e.Focusable()
 	}
 	a, first, last := s.plan(e, n)
 	e.Children(func() {
@@ -233,16 +365,17 @@ func buildList(c *Context, e, owner *Element, s *ListState, n int, row func(i in
 			}
 		}
 	})
+	owner.onValueInput(listInput)
 }
 
 // sync follows what changed since the last frame: rows added or removed,
 // items moving, the user or the app scrolling.
-func (s *ListState) sync(e *Element, n int) {
+func (s *ListState) sync(e *node, n int) {
 	st, rt := e.st, e.c.rt
 	if !s.started {
 		s.started = true
 		s.following = s.FollowEnd
-		s.selRow = -1
+		s.selRow, s.lead, s.pivot = -1, -1, -1
 		s.header.row = -1
 	}
 	s.heights.def = float64(e.c.theme.Space(8))
@@ -257,13 +390,20 @@ func (s *ListState) sync(e *Element, n int) {
 				s.header.ok = false
 			}
 		}
-		if sel := s.Selected; sel != nil && *sel == s.selRow && s.selKey != nil {
+		if sel := s.cursor(); sel != nil && *sel == s.selRow && s.selKey != nil {
 			// The choice follows its item, and is gone with it.
 			j, ok := s.find(s.selKey, *sel, n)
 			if !ok {
 				j = -1
 			}
 			*sel, s.selRow = j, j
+		}
+		if s.pivotKey != nil {
+			j, ok := s.find(s.pivotKey, s.pivot, n)
+			if !ok {
+				j = -1
+			}
+			s.pivot = j
 		}
 	}
 	if n != s.heights.n {
@@ -272,9 +412,10 @@ func (s *ListState) sync(e *Element, n int) {
 	}
 	s.anchor = max(0, min(s.anchor, n-1))
 	switch {
-	case st.list != s || st.born == rt.frame:
+	case st.list != s || st.born == rt.frame || !s.laidOut:
 		// Built anew, as when its page shows again, or showing another
-		// place: the place stands, unless the app set the offset with a
+		// place, or a new one, which did not write the offset its element
+		// has: the place stands, unless the app set the offset with a
 		// ScrollState this frame.
 		if st.movedIn(rt.frame) && !s.req.set {
 			s.req = listRequest{set: true, offset: true, y: max(0, st.scrollY)}
@@ -325,7 +466,7 @@ func (s *ListState) find(k any, near, n int) (int, bool) {
 
 // plan returns the row the place starts from and the rows to build, as far
 // as the heights known tell where the place puts them.
-func (s *ListState) plan(e *Element, n int) (a, first, last int) {
+func (s *ListState) plan(e *node, n int) (a, first, last int) {
 	if n == 0 {
 		return 0, 0, 0
 	}
@@ -361,36 +502,81 @@ func (s *ListState) plan(e *Element, n int) (a, first, last int) {
 }
 
 // build builds row i in the list.
-func (f *listFrame) build(i int) *Element {
+func (f *listFrame) build(i int) *node {
 	c, s := f.c, f.s
 	var key any = i
 	if s.Key != nil {
 		key = s.Key(i)
 	}
-	w := Box(c).Key(key).Shrink(0)
-	w.listRow = true
-	if sel := s.Selected; sel != nil && !f.isHeader(i) {
-		t := c.theme
-		w.flags |= flagClickable | flagHover
+	w := coreBox(c).Key(key).Shrink(0)
+	w.listRow, w.rowIndex = true, i
+	if s.Label != nil {
+		w.Label(s.Label(i))
+	}
+	// Assistive technology sees a row of a table, an item of a tree or of
+	// a list.
+	switch {
+	case f.grid:
+		w.Role(RoleNone)
+	case f.tree:
+		w.Role(RoleTreeItem)
+	case f.flat:
 		w.Role(RoleRow)
-		if w.Clicked() {
-			f.choose(i)
-			f.owner.Focus()
+	default:
+		w.Role(RoleListItem)
+	}
+	prev := f.rb
+	f.rb = rowBuild{f: f, i: i, key: key, clicked: w.st.clicks > 0 && w.st.clickMods == 0, double: w.st.doubleClicks > 0}
+	rb := &f.rb
+	if sel := s.cursor(); sel != nil && !f.isHeader(i) {
+		t := c.theme
+		w.flags |= flagClickable | flagHover | flagChoosable
+		rb.chosen = f.chosen(i, key)
+		*valueBinding[listRowInput](w) = listRowInput{f: f, i: i}
+		w.onValueInput(listRowValueInput)
+		on := f.chosen(i, key)
+		w.Selected(on)
+		switch r := t.Radius; {
+		case f.flat && !s.RoundRows:
+		case s.Selection != nil && s.gap == 0 && on:
+			// Rows chosen together make one block, as in Finder.
+			above := i > 0 && !f.isHeader(i-1) && f.chosen(i-1, f.key(i-1))
+			below := i < f.n-1 && !f.isHeader(i+1) && f.chosen(i+1, f.key(i+1))
+			w.radius = [4]float32{r, r, r, r}
+			if above {
+				w.radius[0], w.radius[1] = 0, 0
+			}
+			if below {
+				w.radius[2], w.radius[3] = 0, 0
+			}
+		default:
+			w.Radius(r)
 		}
-		if w.DoubleClicked() {
-			f.owner.st.submitted = true
-		}
-		w.Selected(*sel == i)
-		if !f.flat {
-			w.Radius(t.Radius)
-		}
-		w.styleFn = func(w *Element) {
+		w.styleFn = func(w *node) {
 			if w.checked != 2 && w.Hovered() {
 				w.bg = t.SurfaceHover
 			}
 		}
+		if owner := f.owner; s.Selection != nil && *sel == i && !on {
+			// Where the keys moved without choosing.
+			w.DrawOver(func(p *Painter, r Rect) {
+				if owner.FocusVisible() {
+					p.FocusRing(Rect{r.X + 3, r.Y + 3, r.W - 6, r.H - 6}, w.radius)
+				}
+			})
+		}
 	}
+	if s.Reorder != nil && !f.isHeader(i) {
+		w.dragFrom(func() any { return &rowDrag{s: s, rows: f.dragged(i)} })
+		if w.Dragging() {
+			// Where the row was, as it moves with the pointer.
+			w.Opacity(0.4)
+		}
+	}
+	saved := c.row
+	c.row = rb
 	w.Children(func() { f.row(i) })
+	c.row, f.rb = saved, prev
 	f.rows = append(f.rows, listRow{i: i, key: key, e: w})
 	return w
 }
@@ -398,7 +584,7 @@ func (f *listFrame) build(i int) *Element {
 // buildLate builds row i while the list lays out, as the view would have:
 // with the theme it built the list with, and its input forgotten once the
 // frame is laid out (layoutTree).
-func (f *listFrame) buildLate(i int) *Element {
+func (f *listFrame) buildLate(i int) *node {
 	c := f.c
 	parent, theme := c.parent, c.theme
 	c.parent, c.theme = f.e, f.theme
@@ -410,63 +596,412 @@ func (f *listFrame) buildLate(i int) *Element {
 
 func (f *listFrame) isHeader(i int) bool { return f.s.Header != nil && f.s.Header(i) }
 
-// choose makes row i the choice, and shows it.
-func (f *listFrame) choose(i int) {
-	if sel := f.s.Selected; *sel != i {
-		*sel = i
-		f.owner.st.changed = true
-		f.c.rt.consumed = true
+// cursor returns where the keys move the choice from, or nil when the list
+// does not choose rows: *Selected, or the row last chosen in a list
+// choosing several without it.
+func (s *ListState) cursor() *int {
+	switch {
+	case s.Selected != nil:
+		return s.Selected
+	case s.Selection != nil:
+		return &s.lead
 	}
-	f.s.ScrollIntoView(i)
+	return nil
+}
+
+// key returns the key of row i, its index without ListState.Key.
+// rowDrag is rows of a list being dragged to another place in it
+// (ListState.Reorder).
+type rowDrag struct {
+	s    *ListState
+	rows []int
+}
+
+func (d *rowDrag) dragCount() int { return len(d.rows) }
+
+// dragged returns the rows a drag from row i moves: those chosen when it
+// is one of them, else row i.
+func (f *listFrame) dragged(i int) []int {
+	s := f.s
+	if s.Selection == nil || !f.chosen(i, f.key(i)) {
+		return []int{i}
+	}
+	var rows []int
+	for j := range f.n {
+		if !f.isHeader(j) && f.chosen(j, f.key(j)) {
+			rows = append(rows, j)
+		}
+	}
+	return rows
+}
+
+// reorder makes the list take its own rows dragged over it: it shows where
+// they would go, and moves them there as they drop (ListState.Reorder).
+func (f *listFrame) reorder() {
+	s, e := f.s, f.e
+	if s.Reorder == nil {
+		return
+	}
+	e.flags |= flagValueDrop
+	e.st.accepts = func(v any) bool { d, ok := v.(*rowDrag); return ok && d.s == s }
+	rt := f.c.rt
+	var d *rowDrag
+	dropped, y := false, rt.pointerY
+	switch {
+	case e.st.hasDropped:
+		// Where the rows dropped, which the pointer may have left since,
+		// as when Windows moves it back to the mouse after a test's drag.
+		d, _ = e.st.droppedValue.(*rowDrag)
+		e.st.hasDropped, dropped, y = false, true, e.st.dropY
+	case rt.drag != nil && !rt.drag.canceled && rt.drag.over == e.id:
+		d, _ = rt.drag.value.(*rowDrag)
+	}
+	if d == nil || d.s != s {
+		return
+	}
+	x := rt.pointerX
+	if dropped {
+		x = e.st.dropX
+	}
+	_, y = e.st.local(x, y)
+	y += e.st.y
+	to := f.dropAt(y)
+	if dropped {
+		// Rows already there stay.
+		if !(len(d.rows) == 1 && (to == d.rows[0] || to == d.rows[0]+1)) {
+			s.Reorder(d.rows, to)
+			rt.consumed = true
+		}
+		return
+	}
+	t := f.c.theme
+	e.DrawOver(func(p *Painter, r Rect) {
+		y, ok := f.boundary(to)
+		if !ok {
+			return
+		}
+		x := r.X + e.contentX()
+		p.Fill(Rect{x + 4, y - 1, r.W - e.padX() - 4, 2}, t.Accent, 1)
+		p.Fill(Rect{x, y - 4, 8, 8}, t.Accent, 4)
+	})
+}
+
+// dropAt returns the row before which rows dropped at y go: that of the
+// row of the last frame whose middle is below y, the number of rows past
+// the last.
+func (f *listFrame) dropAt(y float32) int {
+	to, below := -1, -1
+	for id, r := range f.s.rows {
+		st := f.c.rt.states[id]
+		if st == nil || f.isHeader(r.row) {
+			continue
+		}
+		if y < st.y+st.h/2 {
+			if to < 0 || r.row < to {
+				to = r.row
+			}
+		} else if r.row > below {
+			below = r.row
+		}
+	}
+	if to < 0 {
+		return min(below+1, f.n)
+	}
+	return to
+}
+
+// boundary returns where row i starts, in this frame, or the end of the
+// row before it, for the last.
+func (f *listFrame) boundary(i int) (float32, bool) {
+	for _, r := range f.rows {
+		if r.i == i {
+			return r.e.y - max(f.e.gapY, 0)/2, true
+		}
+	}
+	for _, r := range f.rows {
+		if r.i == i-1 {
+			return r.e.y + r.e.h + max(f.e.gapY, 0)/2, true
+		}
+	}
+	return 0, false
+}
+
+func (f *listFrame) key(i int) any {
+	if f.s.Key != nil {
+		return f.s.Key(i)
+	}
+	return i
+}
+
+// chosen reports whether row i, of key k, is chosen.
+func (f *listFrame) chosen(i int, k any) bool {
+	if sel := f.s.Selection; sel != nil {
+		return sel.has(k)
+	}
+	return *f.s.Selected == i
+}
+
+// changed reports a new choice.
+func (f *listFrame) changed() {
+	f.owner.st.markChanged()
+	f.c.rt.consumed = true
+}
+
+// click chooses row i as a click with mods does.
+func (f *listFrame) click(i int, mods Modifiers) {
+	switch {
+	case f.s.Selection == nil:
+		f.choose(i)
+	case mods&Shift != 0:
+		f.extend(i, mods&Cmd != 0)
+	case mods&Cmd != 0:
+		f.toggle(i)
+	default:
+		f.choose(i)
+	}
+}
+
+// choose makes row i the choice, alone, and shows it.
+func (f *listFrame) choose(i int) {
+	if sel := f.s.Selection; sel != nil {
+		k := f.key(i)
+		if sel.size() != 1 || !sel.has(k) {
+			sel.clear()
+			sel.set(k, true)
+			f.changed()
+		}
+	}
+	f.lead(i, true)
+}
+
+// toggle adds row i to the choice or takes it out, and shows it.
+func (f *listFrame) toggle(i int) {
+	k := f.key(i)
+	f.s.Selection.set(k, !f.s.Selection.has(k))
+	f.changed()
+	f.lead(i, true)
+}
+
+// extend chooses the rows from the pivot to row i, as Shift does: on
+// macOS in place of those it last chose, elsewhere in place of all others
+// unless keep.
+func (f *listFrame) extend(i int, keep bool) {
+	s, sel := f.s, f.s.Selection
+	p := s.pivot
+	if p < 0 || p >= f.n || f.isHeader(p) {
+		f.choose(i)
+		return
+	}
+	lo, hi := min(p, i), max(p, i)
+	changed := false
+	switch {
+	case runtime.GOOS == "darwin":
+		last := max(0, min(p+s.span, f.n-1))
+		for j := min(p, last); j <= max(p, last); j++ {
+			if (j < lo || j > hi) && !f.isHeader(j) {
+				changed = sel.set(f.key(j), false) || changed
+			}
+		}
+	case !keep:
+		in := 0
+		for j := lo; j <= hi; j++ {
+			if !f.isHeader(j) && sel.has(f.key(j)) {
+				in++
+			}
+		}
+		if sel.size() > in {
+			changed = sel.clear()
+		}
+	}
+	for j := lo; j <= hi; j++ {
+		if !f.isHeader(j) {
+			changed = sel.set(f.key(j), true) || changed
+		}
+	}
+	if changed {
+		f.changed()
+	}
+	s.span = i - p
+	f.lead(i, false)
+}
+
+// lead makes row i the one the keys move from, and with pivot the one
+// Shift extends the choice from, and shows it.
+func (f *listFrame) lead(i int, pivot bool) {
+	s := f.s
+	if sel := s.cursor(); *sel != i {
+		*sel = i
+		if s.Selection == nil || s.Selected != nil {
+			f.changed()
+		}
+		f.c.rt.consumed = true // the rows show where it is
+	}
+	if pivot {
+		s.pivot, s.span = i, 0
+	}
+	s.ScrollIntoView(i)
+}
+
+// step returns the first row from i on by d that is not a header, or -1.
+func (f *listFrame) step(i, d int) int {
+	for i += d; i >= 0 && i < f.n; i += d {
+		if !f.isHeader(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// page returns the row a page down from the one the keys move from (up
+// for d -1): the last row in view, or a page further from there.
+func (f *listFrame) page(d int) int {
+	s, n := f.s, f.n
+	i := *s.cursor()
+	view := float64(f.e.st.h)
+	if i < 0 || i >= n || !s.laidOut || view <= 0 {
+		return f.step(-1, 1)
+	}
+	to := s.heights.rowAt(max(0, s.heights.top(i, s.gap)+float64(d)*view), s.gap)
+	switch {
+	case d > 0 && i >= s.first && i < s.last:
+		to = s.last
+	case d < 0 && i > s.first && i <= s.last:
+		to = s.first
+	}
+	to = max(0, min(to, n-1))
+	if f.isHeader(to) {
+		if j := f.step(to, d); j >= 0 {
+			return j
+		}
+		return f.step(to, -d)
+	}
+	return to
 }
 
 // navigate moves the choice with the keys, past headers.
 func (f *listFrame) navigate() {
-	o, n, sel := f.owner, f.n, f.s.Selected
+	o, n, sel, s := f.owner, f.n, f.s.cursor(), f.s
+	multi, mac := s.Selection != nil, runtime.GOOS == "darwin"
+	if s.Label != nil {
+		o.flags |= flagTypeSelect
+	}
 	if n == 0 {
 		return
 	}
-	// step returns the first row from i on by d that is not a header.
-	step := func(i, d int) int {
-		for i += d; i >= 0 && i < n; i += d {
-			if !f.isHeader(i) {
-				return i
+	// Every key is asked for in every frame, which keeps it.
+	const (
+		move = iota + 1
+		extend
+		cursor
+	)
+	keys := []Key{KeyDown, KeyUp, KeyHome, KeyEnd, KeyPageDown, KeyPageUp}
+	if mac {
+		keys = keys[:4] // the others scroll, on macOS
+	}
+	how, key := 0, Key(0)
+	for _, k := range keys {
+		if o.Shortcut(0, k) {
+			how, key = move, k
+		}
+		if multi && o.Shortcut(Shift, k) {
+			how, key = extend, k
+		}
+		if multi && !mac && o.Shortcut(Ctrl, k) {
+			how, key = cursor, k
+		}
+	}
+	all := multi && o.Shortcut(Cmd, KeyA)
+	flip := multi && !mac && o.Shortcut(Ctrl, KeySpace)
+	in := *sel >= 0 && *sel < n
+	// Enter on macOS, as in Finder, and F2 elsewhere edit the text of the
+	// row chosen in place (EditableText), where it has one.
+	enter := o.Shortcut(0, KeyEnter)
+	edit := s.editables && (o.Shortcut(0, KeyF2) || mac && enter)
+	switch {
+	case edit && in && !f.isHeader(*sel):
+		s.editKey, s.editAsked = f.key(*sel), true
+		s.ScrollIntoView(*sel)
+	case enter && in:
+		o.st.markSubmitted()
+	}
+	to := -1
+	switch key {
+	case KeyDown:
+		to = f.step(max(*sel, -1), 1)
+	case KeyUp:
+		if to = f.step(*sel, -1); !in {
+			to = f.step(-1, 1)
+		}
+	case KeyHome:
+		to = f.step(-1, 1)
+	case KeyEnd:
+		to = f.step(n, -1)
+	case KeyPageDown:
+		to = f.page(1)
+	case KeyPageUp:
+		to = f.page(-1)
+	}
+	switch {
+	case how == 0:
+	case to < 0 && in:
+		// Nowhere further: the choice shows again, if it scrolled away.
+		s.ScrollIntoView(*sel)
+	case to < 0:
+	case how == move:
+		f.choose(to)
+	case how == extend:
+		f.extend(to, false)
+	case how == cursor:
+		f.lead(to, false)
+	}
+	if all {
+		changed := false
+		for j := range n {
+			if !f.isHeader(j) {
+				changed = s.Selection.set(f.key(j), true) || changed
 			}
 		}
+		if changed {
+			f.changed()
+		}
+	}
+	if flip && *sel >= 0 && *sel < n && !f.isHeader(*sel) {
+		f.toggle(*sel)
+	}
+	if o.st.typing && s.Label != nil {
+		if j := f.typed(o.st.typed); j >= 0 {
+			f.choose(j)
+		}
+	}
+}
+
+// typed returns the row whose text starts with what was typed, from the
+// row the keys move from on, or -1: the same letter again goes to the
+// next row starting with it.
+func (f *listFrame) typed(text string) int {
+	n, cur := f.n, *f.s.cursor()
+	if text == "" {
 		return -1
 	}
-	to, moved := -1, true
-	switch {
-	case o.Shortcut(0, KeyDown):
-		to = step(max(*sel, -1), 1)
-	case o.Shortcut(0, KeyUp):
-		if to = step(*sel, -1); *sel < 0 || *sel >= n {
-			to = step(-1, 1)
+	from := max(cur, 0)
+	if strings.Count(text, text[:1]) == len(text) {
+		text = text[:1]
+		if cur >= 0 {
+			from = cur + 1
 		}
-	case o.Shortcut(0, KeyHome):
-		to = step(-1, 1)
-	case o.Shortcut(0, KeyEnd):
-		to = step(n, -1)
-	case o.Shortcut(0, KeyEnter):
-		if *sel >= 0 && *sel < n {
-			o.st.submitted = true
+	}
+	for d := range n {
+		i := (from + d) % n
+		if l := f.s.Label(i); len(l) >= len(text) && strings.EqualFold(l[:len(text)], text) && !f.isHeader(i) {
+			return i
 		}
-		moved = false
-	default:
-		moved = false
 	}
-	switch {
-	case to >= 0:
-		f.choose(to)
-	case moved && *sel >= 0 && *sel < n:
-		// Nowhere further: the choice shows again, if it scrolled away.
-		f.s.ScrollIntoView(*sel)
-	}
+	return -1
 }
 
 // focusedRow returns the row holding the keyboard focus in the last
 // frame, where it is now.
-func (s *ListState) focusedRow(e *Element, n int) (int, bool) {
+func (s *ListState) focusedRow(e *node, n int) (int, bool) {
 	rt := e.c.rt
 	if rt.focused == 0 || len(s.rows) == 0 {
 		return 0, false
@@ -495,12 +1030,22 @@ func (s *ListState) focusedRow(e *Element, n int) (int, bool) {
 // sets the size of the content and the offset. Without rows, what else was
 // built in the list shows, as a scroll container's content: a message that
 // it is empty, say.
-func (e *Element) layoutList(w, h float32) {
+func (e *node) layoutList(w, h float32) {
 	f := e.list
 	s, n := f.s, f.n
 	hs := &s.heights
 	st := e.st
 	cw := max(w-e.padX(), 0)
+	if e.flags&flagScrollX != 0 {
+		// Rows at least as wide as they ask, as a table's columns, which
+		// scroll sideways.
+		cw = max(cw, e.rowMinW)
+	}
+	if g := e.gridFit; g != nil && max(1, int(math.Floor(float64((cw+g.gap)/(g.minW+g.gap))))) != g.cols {
+		// The items of a grid take other columns: the next frame builds
+		// them so.
+		e.c.rt.animating = true
+	}
 	if cw != s.width {
 		// The rows wrap anew: heights measured at another width are gone.
 		hs.clear()
@@ -514,7 +1059,7 @@ func (e *Element) layoutList(w, h float32) {
 	st.list = s
 	if n == 0 {
 		_, uh := boxLayout(e, cw, inf, true)
-		e.contentW, e.contentH = float64(w), float64(max(uh, max(h-e.padY(), 0))+e.padY())
+		e.contentW, e.contentH = float64(cw+e.padX()), float64(max(uh, max(h-e.padY(), 0))+e.padY())
 		layoutAbsolute(e)
 		e.scrollBase = 0
 		s.remember(e, 0, -1, true, st.scrollY)
@@ -681,7 +1226,7 @@ func (e *Element) layoutList(w, h float32) {
 		first, last = a, a-1
 	}
 	inset := padTop - f.rows[f.at[first]].y
-	var pinned *Element
+	var pinned *node
 	if s.Header != nil && last >= first {
 		pinned = e.pinHeader(first, hi, top)
 	}
@@ -689,15 +1234,15 @@ func (e *Element) layoutList(w, h float32) {
 	// Lay the rows out in order, as they show, Tab moves and assistive
 	// technology reads, then what else was built above them, which lies
 	// over the rows.
-	var extras []*Element
+	var extras []*node
 	for ch := e.first; ch != nil; ch = ch.next {
 		if !ch.listRow && ch.flags&flagAbsolute != 0 {
 			extras = append(extras, ch)
 		}
 	}
 	slices.SortFunc(f.rows, func(a, b listRow) int { return a.i - b.i })
-	var prev *Element
-	link := func(ch *Element) {
+	var prev *node
+	link := func(ch *node) {
 		ch.next = nil
 		if prev == nil {
 			e.first = ch
@@ -722,7 +1267,7 @@ func (e *Element) layoutList(w, h float32) {
 		// offset moves before placing.
 		pinned.flags |= flagAbsolute
 	}
-	e.contentW, e.contentH = float64(w), content
+	e.contentW, e.contentH = float64(cw+e.padX()), content
 	e.scrollBase = scroll
 	st.scrollTo(st.scrollX, scroll)
 	s.inset = inset
@@ -732,7 +1277,7 @@ func (e *Element) layoutList(w, h float32) {
 // relayoutList lays the list out anew scrolled to y, as revealing its
 // row ch asks, from where the heights known put ch: the rows around it
 // are built, and the frame shows no gap.
-func (e *Element) relayoutList(ch *Element, y float64) {
+func (e *node) relayoutList(ch *node, y float64) {
 	f := e.list
 	if f.n == 0 {
 		e.st.scrollTo(e.st.scrollX, y)
@@ -750,7 +1295,7 @@ func (e *Element) relayoutList(ch *Element, y float64) {
 
 // remember keeps where the list is for the next frame, and builds another
 // for a view that read where it was.
-func (s *ListState) remember(e *Element, first, last int, atEnd bool, scroll float64) {
+func (s *ListState) remember(e *node, first, last int, atEnd bool, scroll float64) {
 	f, n := e.list, e.list.n
 	if s.read && (first != s.first || last != s.last || atEnd != s.atEnd) {
 		e.c.rt.animating = true
@@ -764,12 +1309,15 @@ func (s *ListState) remember(e *Element, first, last int, atEnd bool, scroll flo
 	} else if s.Key != nil {
 		s.anchorKey = s.Key(first)
 	}
-	s.selKey = nil
-	if sel := s.Selected; sel != nil {
+	s.selKey, s.pivotKey = nil, nil
+	if sel := s.cursor(); sel != nil {
 		s.selRow = *sel
 		if s.Key != nil && *sel >= 0 && *sel < n {
 			s.selKey = s.Key(*sel)
 		}
+	}
+	if s.Key != nil && s.Selection != nil && s.pivot >= 0 && s.pivot < n {
+		s.pivotKey = s.Key(s.pivot)
 	}
 	if s.rows == nil {
 		s.rows = map[uint64]listRowID{}
@@ -783,7 +1331,7 @@ func (s *ListState) remember(e *Element, first, last int, atEnd bool, scroll flo
 // pinHeader moves the header of the section of row first, the first in
 // view, to the top of the list, below which the next header pushes it,
 // and returns it if it moved.
-func (e *Element) pinHeader(first, hi int, top float64) *Element {
+func (e *node) pinHeader(first, hi int, top float64) *node {
 	f := e.list
 	s := f.s
 	hh := s.headerAbove(first, f.n)

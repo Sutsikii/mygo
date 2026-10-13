@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/egoist/mygo/internal/platform"
@@ -59,6 +60,13 @@ type Backend struct {
 	// title bar (titlebar.go), captionFonts their glyphs by DPI.
 	captions     map[uintptr]*captionBar
 	captionFonts map[int]captionFont
+	// comp shows the controls of windows with a material behind them
+	// (compositor.go). compRetry is when to try making it again after
+	// compFails failures in a row, and composeAt when timerCompose draws
+	// again the controls that could not draw, zero when it is not set.
+	comp                 *composition
+	compRetry, composeAt time.Time
+	compFails            int
 
 	// surfaces are the windows of the content MyGo draws (surface.go).
 	surfaces map[uintptr]*surface
@@ -105,6 +113,8 @@ func (b *Backend) Init(h platform.AppHandler, opts platform.AppOptions) error {
 	}
 	b.taskbarCreated = registerWindowMessage("TaskbarCreated")
 	b.taskbarButtonCreated = registerWindowMessage("TaskbarButtonCreated")
+	// Clipboard and drag/drop share startup-created OLE callback tables.
+	dropOnce.Do(initDropTarget)
 	return nil
 }
 
@@ -234,10 +244,13 @@ func registerClasses() error {
 	wndProcCallback = syscall.NewCallback(wndProc)
 	cursor, _, _ := procLoadCursorW.Call(0, idcArrow)
 	icon, _, _ := procLoadIconW.Call(instance(), 1) // the icon resource `mygo build` embeds
-	for _, name := range []string{appClass, windowClass, captionClass} {
+	for _, name := range []string{appClass, windowClass, captionClass, flyoutShadowClass} {
 		style := uint32(0x0003) // CS_HREDRAW | CS_VREDRAW
-		if name == captionClass {
+		switch name {
+		case captionClass:
 			style = 0x0008 // CS_DBLCLKS: a double click on the top edge
+		case flyoutShadowClass:
+			style |= 0x00020000 // CS_DROPSHADOW
 		}
 		wc := wndClassEx{
 			Style:     style,
@@ -315,14 +328,25 @@ func (b *Backend) appMessage(m uint32, wp, lp uintptr) (uintptr, bool) {
 		b.powerMessage(m, wp)
 		return 1, false // TRUE for power broadcasts, and default handling
 	case wmSettingChange:
-		if lp != 0 && wstr(lp) == "ImmersiveColorSet" {
+		switch {
+		case lp != 0 && wstr(lp) == settingImmersiveColorSet:
 			b.applyTheme()
+			b.h.ThemeChanged()
+		case preferencesChanged(wp, lp):
 			b.h.ThemeChanged()
 		}
 		return 0, false
 	case wmDisplayChange:
 		b.h.DisplaysChanged()
 		return 0, false
+	case wmTimer:
+		if wp == timerCompose {
+			b.recompose()
+			return 0, true
+		}
+	case wmAppDeviceRemoved:
+		b.deviceRemoved(wp)
+		return 0, true
 	case wmQueryEndSession:
 		return 1, true
 	case wmEndSession:

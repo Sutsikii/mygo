@@ -10,6 +10,8 @@ import (
 
 	"github.com/ebitengine/purego"
 	"github.com/ebitengine/purego/objc"
+	"github.com/egoist/mygo/internal/platform"
+	"github.com/egoist/mygo/transfer"
 )
 
 // The functions in this file drive native UI the way a user would, for the
@@ -71,15 +73,63 @@ func TestEndSheet(handle uintptr) bool {
 
 // TestClick sends a left mouse down and up at a point of a window's content
 // (top-left origin, in points), like a user click.
-func TestClick(handle uintptr, x, y float64) {
+func TestClick(handle uintptr, x, y float64) { testClick(handle, x, y, false) }
+
+// TestAppClick is TestClick through the application's event queue, where
+// event monitors see the click as they see the user's, as those of
+// transient popovers that close on clicks elsewhere.
+func TestAppClick(handle uintptr, x, y float64) { testClick(handle, x, y, true) }
+
+// TestAppPress is half of TestAppClick: the left mouse down, or the up,
+// which a user's click handles apart, a frame or more later.
+func TestAppPress(handle uintptr, x, y float64, down bool) {
+	typ := uint(2) // NSEventTypeLeftMouseUp
+	if down {
+		typ = 1 // NSEventTypeLeftMouseDown
+	}
+	testMouse(handle, x, y, true, typ)
+}
+
+func testClick(handle uintptr, x, y float64, viaApp bool) {
+	testMouse(handle, x, y, viaApp, 1, 2) // NSEventTypeLeftMouseDown, LeftMouseUp
+}
+
+func testMouse(handle uintptr, x, y float64, viaApp bool, types ...uint) {
 	withPool(func() {
 		win := id(handle)
 		content := msgRect(send(win, "contentView"), sel("frame"))
 		loc := NSPoint{x, content.Size.Height - y}
 		number := sendInt(win, "windowNumber")
-		for _, typ := range []uint{1, 2} { // NSEventTypeLeftMouseDown, LeftMouseUp
+		for _, typ := range types {
 			ev := msgMouseEvent(class("NSEvent"), sel("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
 				typ, loc, 0, 0, number, 0, 0, 1, 1)
+			if viaApp {
+				send(theBackend.app, "postEvent:atStart:", uintptr(ev), 0)
+			} else {
+				send(win, "sendEvent:", uintptr(ev))
+			}
+		}
+	})
+}
+
+// TestDrag presses the primary button at the first of points, in points
+// from the top-left corner of a window's content, drags the pointer through
+// the others, and releases it at the last.
+func TestDrag(handle uintptr, points [][2]float64) {
+	withPool(func() {
+		win := id(handle)
+		content := msgRect(send(win, "contentView"), sel("frame"))
+		number := sendInt(win, "windowNumber")
+		for i, p := range points {
+			typ := uint(6) // NSEventTypeLeftMouseDragged
+			switch i {
+			case 0:
+				typ = 1 // NSEventTypeLeftMouseDown
+			case len(points) - 1:
+				typ = 2 // NSEventTypeLeftMouseUp
+			}
+			ev := msgMouseEvent(class("NSEvent"), sel("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
+				typ, NSPoint{p[0], content.Size.Height - p[1]}, 0, 0, number, 0, 0, 1, 1)
 			send(win, "sendEvent:", uintptr(ev))
 		}
 	})
@@ -101,6 +151,45 @@ func TestControlClick(handle uintptr, x, y float64) {
 	})
 }
 
+var (
+	testSideOnce sync.Once
+	// cgEventSetIntegerValueField is CGEventSetIntegerValueField.
+	cgEventSetIntegerValueField func(event uintptr, field uint32, value int64)
+)
+
+// TestSideButton presses and releases a mouse's back or forward button
+// (buttons 3 and 4) in a window showing native UI.
+func TestSideButton(handle uintptr, back bool) bool {
+	w := theBackend.byNSWindow[id(handle)]
+	if w == nil || w.surface == nil {
+		return false
+	}
+	testSideOnce.Do(func() {
+		purego.RegisterLibFunc(&cgEventSetIntegerValueField, libCG, "CGEventSetIntegerValueField")
+	})
+	button := int64(4)
+	if back {
+		button = 3
+	}
+	withPool(func() {
+		number := sendInt(w.win, "windowNumber")
+		for _, typ := range []uint{25, 26} { // NSEventTypeOtherMouseDown, OtherMouseUp
+			ev := msgMouseEvent(class("NSEvent"), sel("mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:"),
+				typ, NSPoint{10, 10}, 0, 0, number, 0, 0, 1, 1)
+			// NSEvent makes other buttons the middle one: number it.
+			cg := send(ev, "CGEvent")
+			cgEventSetIntegerValueField(uintptr(cg), 3, button) // kCGMouseEventButtonNumber
+			ev = send(class("NSEvent"), "eventWithCGEvent:", uintptr(cg))
+			name := "otherMouseDown:"
+			if typ == 26 {
+				name = "otherMouseUp:"
+			}
+			send(w.surface.view, name, uintptr(ev))
+		}
+	})
+	return true
+}
+
 // TestTrafficLights returns where the top-left corner of a window's close
 // button is, in points from the top-left corner of the window.
 func TestTrafficLights(handle uintptr) (x, y float64) {
@@ -111,6 +200,18 @@ func TestTrafficLights(handle uintptr) (x, y float64) {
 	a := msgPointFromView(parent, sel("convertPoint:toView:"), f.Origin, 0)
 	b := msgPointFromView(parent, sel("convertPoint:toView:"), NSPoint{f.Origin.X + f.Size.Width, f.Origin.Y + f.Size.Height}, 0)
 	return math.Min(a.X, b.X), msgRect(win, sel("frame")).Size.Height - math.Max(a.Y, b.Y)
+}
+
+// TestSetWindowAppearance gives a window its own dark or light appearance,
+// apart from the application's.
+func TestSetWindowAppearance(handle uintptr, dark bool) {
+	name := "NSAppearanceNameAqua"
+	if dark {
+		name = "NSAppearanceNameDarkAqua"
+	}
+	withPool(func() {
+		send(id(handle), "setAppearance:", uintptr(send(class("NSAppearance"), "appearanceNamed:", uintptr(nsString(name)))))
+	})
 }
 
 // TestWebViewAttached reports whether a window's web view is in its view
@@ -295,6 +396,51 @@ func TestClickAndType(handle uintptr, x, y float64, text string) bool {
 	return true
 }
 
+// TestKey presses and releases the key of virtual key code code, typing
+// chars, in a window showing native UI, as the keyboard does: the events
+// go through the window to its first responder, the surface and its input
+// method or a web view.
+func TestKey(handle uintptr, code uint16, chars string) bool {
+	return TestKeyShift(handle, code, chars, false)
+}
+
+// TestAppKey posts a key down and up to the application's event queue,
+// which sends it to the key window as it does the user's keys, to a page
+// or native UI.
+func TestAppKey(code uint16, chars string) {
+	withPool(func() {
+		number := sendInt(send(theBackend.app, "keyWindow"), "windowNumber")
+		s := nsString(chars)
+		for _, typ := range []uint{10, 11} { // NSEventTypeKeyDown, KeyUp
+			ev := msgKeyEvent(class("NSEvent"), sel("keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:"),
+				typ, NSPoint{}, 0, 0, number, 0, s, s, false, code)
+			send(theBackend.app, "postEvent:atStart:", uintptr(ev), 0)
+		}
+	})
+}
+
+// TestKeyShift is TestKey with Shift held when shift is set.
+func TestKeyShift(handle uintptr, code uint16, chars string, shift bool) bool {
+	w := theBackend.byNSWindow[id(handle)]
+	if w == nil || w.surface == nil {
+		return false
+	}
+	var flags uint
+	if shift {
+		flags = 1 << 17 // NSEventModifierFlagShift
+	}
+	withPool(func() {
+		number := sendInt(w.win, "windowNumber")
+		s := nsString(chars)
+		for _, typ := range []uint{10, 11} { // NSEventTypeKeyDown, KeyUp
+			ev := msgKeyEvent(class("NSEvent"), sel("keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:"),
+				typ, NSPoint{}, flags, 0, number, 0, s, s, false, code)
+			send(w.win, "sendEvent:", uintptr(ev))
+		}
+	})
+	return true
+}
+
 // TestCompose does what an input method does to a window showing native
 // UI: it shows text as the composition, its caret at rune caret, or with
 // commit, inserts it. It reports false for a window showing a web page.
@@ -337,7 +483,11 @@ func TestInputClient(handle uintptr) (selected [2]int, document string) {
 	withPool(func() {
 		doc, _, _ := w.surface.document()
 		var actual nsRange
-		document = stringOf(w.surface.substring(nsRange{Length: uint(units(doc))}, &actual))
+		length := uint(units(doc))
+		if w.surface.input.Client != nil {
+			length = 1<<31 - 1
+		}
+		document = stringOf(w.surface.substring(nsRange{Length: length}, &actual))
 	})
 	return [2]int{int(r.Location), int(r.Length)}, document
 }
@@ -347,13 +497,16 @@ var (
 	testDragInfo id
 	testDragAt   NSPoint
 	testDragPB   id
+	testDragMask uint = 1
 )
 
 // TestDropFiles drags files over (x, y), in points from the top-left
 // corner of a window's content, and drops them there, as Finder would:
 // it calls the surface's dragging methods with an NSDraggingInfo of its
-// own. It reports whether the surface took the files over that point and
-// whether it took the drop.
+// own, and puts on the pasteboard the file reference URLs of the files
+// that exist at those paths, with no symbolic links. It reports whether
+// the surface took the files over that point and whether it took the
+// drop.
 func TestDropFiles(handle uintptr, x, y float64, paths []string) (over, dropped bool) {
 	w := theBackend.byNSWindow[id(handle)]
 	if w == nil || w.surface == nil {
@@ -363,18 +516,23 @@ func TestDropFiles(handle uintptr, x, y float64, paths []string) (over, dropped 
 		classDef("MyGoTestDraggingInfo", "NSObject", nil, []objc.MethodDef{
 			method("draggingLocation", func(self id, _ objc.SEL) NSPoint { return testDragAt }),
 			method("draggingPasteboard", func(self id, _ objc.SEL) id { return testDragPB }),
-			method("draggingSourceOperationMask", func(self id, _ objc.SEL) uint { return 1 }),
+			method("draggingSourceOperationMask", func(self id, _ objc.SEL) uint { return testDragMask }),
 		})
 		testDragInfo = send(send(class("MyGoTestDraggingInfo"), "alloc"), "init")
 		testDragPB = retain(send(class("NSPasteboard"), "pasteboardWithUniqueName"))
 	})
 	withPool(func() {
 		content := msgRect(send(w.win, "contentView"), sel("frame"))
+		testDragMask = 1
 		testDragAt = NSPoint{x, content.Size.Height - y}
 		send(testDragPB, "clearContents")
 		var urls []id
 		for _, p := range paths {
-			urls = append(urls, send(class("NSURL"), "fileURLWithPath:", uintptr(nsString(p))))
+			u := fileURL(p)
+			if ref := send(u, "fileReferenceURL"); ref != 0 && goString(send(send(ref, "filePathURL"), "path")) == p {
+				u = ref
+			}
+			urls = append(urls, u)
 		}
 		send(testDragPB, "writeObjects:", uintptr(nsArray(urls...)))
 		v := w.surface.view
@@ -387,6 +545,38 @@ func TestDropFiles(handle uintptr, x, y float64, paths []string) (over, dropped 
 		dropped = sendBool(v, "prepareForDragOperation:", uintptr(testDragInfo)) && sendBool(v, "performDragOperation:", uintptr(testDragInfo))
 	})
 	return over, dropped
+}
+
+// TestDropData exercises native source pasteboard providers and the
+// destination protocol with serialized data (no core session token).
+func TestDropData(handle uintptr, x, y float64, data transfer.Data, operations transfer.Operation) (operation transfer.Operation, dropped bool) {
+	w := theBackend.byNSWindow[id(handle)]
+	if w == nil || w.surface == nil {
+		return
+	}
+	TestDropFiles(handle, -1, -1, nil)
+	withPool(func() {
+		testDragMask = macOperations(operations)
+		content := msgRect(send(w.win, "contentView"), sel("frame"))
+		testDragAt = NSPoint{x, content.Size.Height - y}
+		src := &macDataSource{r: platform.DragRequest{Data: data.Snapshot()}}
+		defer func() {
+			send(testDragPB, "clearContents")
+			for _, p := range src.providers {
+				delete(macDragProviders, p)
+				release(p)
+			}
+		}()
+		send(testDragPB, "clearContents")
+		send(testDragPB, "writeObjects:", uintptr(nsArray(src.pasteboardItems()...)))
+		v := w.surface.view
+		operation = goOperations(uint(send(v, "draggingEntered:", uintptr(testDragInfo))))
+		if operation != transfer.None {
+			dropped = sendBool(v, "performDragOperation:", uintptr(testDragInfo))
+		}
+		send(v, "draggingExited:", uintptr(testDragInfo))
+	})
+	return
 }
 
 // TestAccessNode is an element of native UI as assistive technology reads
@@ -468,4 +658,61 @@ func TestAccessibilityPerform(handle uintptr, label, action, value string) bool 
 		return ok
 	}
 	return false
+}
+
+// TestAccessibilityAttribute reads an attribute of the element labeled
+// label through AppKit's older API, as assistive technology does: its
+// value, whether it is settable, and whether the element names it.
+func TestAccessibilityAttribute(handle uintptr, label, attr string) (value string, settable, named, ok bool) {
+	for _, n := range TestAccessibility(handle) {
+		if n.Label != label {
+			continue
+		}
+		withPool(func() {
+			name := nsString(attr)
+			if v := send(n.obj, "accessibilityAttributeValue:", uintptr(name)); v != 0 {
+				value = goString(send(v, "description"))
+			}
+			settable = sendBool(n.obj, "accessibilityIsAttributeSettable:", uintptr(name))
+			for _, a := range arrayItems(send(n.obj, "accessibilityAttributeNames")) {
+				named = named || goString(a) == attr
+			}
+		})
+		return value, settable, named, true
+	}
+	return "", false, false, false
+}
+
+// TestObserve has key-value observing watch the view of a window showing
+// native UI and the elements of it that assistive technology reads, as
+// other code may: the runtime gives each a generated subclass of its
+// class, whose methods reach the overrides of MyGo's classes. stop ends it.
+func TestObserve(handle uintptr) (stop func()) {
+	w := theBackend.byNSWindow[id(handle)]
+	if w == nil || w.surface == nil {
+		return func() {}
+	}
+	type observed struct {
+		obj id
+		key string
+	}
+	list := []observed{{w.surface.view, "frame"}}
+	for _, n := range TestAccessibility(handle) {
+		list = append(list, observed{n.obj, "accessibilityValue"})
+	}
+	withPool(func() {
+		for _, o := range list {
+			// Kept until stop: an object observed must not go away.
+			retain(o.obj)
+			send(o.obj, "addObserver:forKeyPath:options:context:", uintptr(w.delegate), uintptr(nsString(o.key)), 0, 0)
+		}
+	})
+	return func() {
+		withPool(func() {
+			for _, o := range list {
+				send(o.obj, "removeObserver:forKeyPath:", uintptr(w.delegate), uintptr(nsString(o.key)))
+				release(o.obj)
+			}
+		})
+	}
 }

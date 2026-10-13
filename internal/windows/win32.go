@@ -43,14 +43,28 @@ func systemDLL(name string) *syscall.LazyDLL { return syscall.NewLazyDLL(sysDir 
 // has reports whether an optional API exists on this version of Windows.
 func has(p *syscall.LazyProc) bool { return p.Find() == nil }
 
-// windows11 reports Windows 11 (build 22000) or later. RtlGetVersion tells
-// the version whatever the executable's manifest declares.
-var windows11 = sync.OnceValue(func() bool {
+// windowsBuild returns the build of Windows 10 or 11, the maximum on a
+// later major version. RtlGetVersion tells the version whatever the
+// executable's manifest declares.
+var windowsBuild = sync.OnceValue(func() uint32 {
 	var v osVersionInfo
 	v.Size = uint32(unsafe.Sizeof(v))
 	procRtlGetVersion.Call(uintptr(unsafe.Pointer(&v)))
-	return v.Major > 10 || v.Major == 10 && v.Build >= 22000
+	switch {
+	case v.Major > 10:
+		return ^uint32(0)
+	case v.Major < 10:
+		return 0
+	}
+	return v.Build
 })
+
+// windows11 reports Windows 11 (build 22000) or later.
+func windows11() bool { return windowsBuild() >= 22000 }
+
+// systemBackdrops reports Windows 11 22H2 (build 22621) or later, where
+// DWM draws the materials of DWMWA_SYSTEMBACKDROP_TYPE.
+func systemBackdrops() bool { return windowsBuild() >= 22621 }
 
 var (
 	// kernel32
@@ -101,6 +115,7 @@ var (
 	procSetWindowLongPtrW             = user32.NewProc("SetWindowLongPtrW")
 	procSetForegroundWindow           = user32.NewProc("SetForegroundWindow")
 	procGetForegroundWindow           = user32.NewProc("GetForegroundWindow")
+	procNotifyWinEvent                = user32.NewProc("NotifyWinEvent")
 	procSetFocus                      = user32.NewProc("SetFocus")
 	procEnableWindow                  = user32.NewProc("EnableWindow")
 	procGetWindowPlacement            = user32.NewProc("GetWindowPlacement")
@@ -108,6 +123,7 @@ var (
 	procMonitorFromWindow             = user32.NewProc("MonitorFromWindow")
 	procMonitorFromPoint              = user32.NewProc("MonitorFromPoint")
 	procGetMonitorInfoW               = user32.NewProc("GetMonitorInfoW")
+	procEnumDisplaySettingsW          = user32.NewProc("EnumDisplaySettingsW")
 	procEnumDisplayMonitors           = user32.NewProc("EnumDisplayMonitors")
 	procGetCursorPos                  = user32.NewProc("GetCursorPos")
 	procLoadCursorW                   = user32.NewProc("LoadCursorW")
@@ -260,6 +276,9 @@ const (
 	wmAppWake     = wmApp + 2
 	wmAppTray     = wmApp + 3
 	wmAppReady    = wmApp + 4
+	// wmAppDeviceRemoved tells the application window that the GPU device
+	// of DirectComposition was removed (compositor.go).
+	wmAppDeviceRemoved = wmApp + 5
 
 	wsOverlapped       = 0x00000000
 	wsPopup            = 0x80000000
@@ -351,6 +370,7 @@ const (
 	tpmReturnCmd   = 0x0100
 	mncClose       = 1
 
+	monitorDefaultToNull    = 0
 	monitorDefaultToNearest = 2
 	monitorDefaultToPrimary = 1
 	monitorInfoPrimary      = 1
@@ -365,6 +385,9 @@ const (
 	vkLWin    = 0x5B
 	vkRWin    = 0x5C
 
+	vkProcessKey = 0xE5
+	vkPacket     = 0xE7
+
 	cfUnicodeText = 13
 	cfDIB         = 8
 	cfDIBV5       = 17
@@ -372,8 +395,11 @@ const (
 
 	idcArrow = 32512
 
-	dwmwaUseImmersiveDarkMode = 20
-	dwmwaSystemBackdropType   = 38
+	dwmwaUseImmersiveDarkMode   = 20
+	dwmwaWindowCornerPreference = 33
+	dwmwaSystemBackdropType     = 38
+
+	dwmwcpRound = 2 // DWM_WINDOW_CORNER_PREFERENCE
 
 	lwaAlpha = 0x2
 	ulwAlpha = 0x2
@@ -400,6 +426,7 @@ const (
 
 	sOK          = 0
 	eNoInterface = 0x80004002
+	eFail        = 0x80004005
 )
 
 type rect struct{ Left, Top, Right, Bottom int32 }
@@ -451,6 +478,29 @@ type monitorInfoEx struct {
 	Flags   uint32
 	Device  [32]uint16
 }
+
+// devMode is DEVMODEW, of a display: Position holds the union of the
+// printer's fields and the display's.
+type devMode struct {
+	DeviceName                                    [32]uint16
+	SpecVersion, DriverVersion, Size, DriverExtra uint16
+	Fields                                        uint32
+	Position                                      [16]byte
+	Color, Duplex, YResolution, TTOption, Collate int16
+	FormName                                      [32]uint16
+	LogPixels                                     uint16
+	BitsPerPel, PelsWidth, PelsHeight             uint32
+	DisplayFlags, DisplayFrequency                uint32
+	ICMMethod, ICMIntent, MediaType, DitherType   uint32
+	Reserved1, Reserved2                          uint32
+	PanningWidth, PanningHeight                   uint32
+}
+
+// DEVMODEW is 220 bytes.
+var _ = [1]struct{}{}[unsafe.Sizeof(devMode{})-220]
+
+// enumCurrentSettings asks EnumDisplaySettingsW for the mode in use.
+const enumCurrentSettings = 0xFFFFFFFF
 
 type windowPos struct {
 	HWnd, InsertAfter uintptr

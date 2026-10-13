@@ -78,7 +78,7 @@ func (s *SVG) imageSize() (float32, float32) {
 //		ui.Icon(c, save)
 //		ui.Text(c, "Save")
 //	})
-func Icon(c *Context, s *SVG) *Element {
+func coreIcon(c *context, s *SVG) *node {
 	e := c.newElement(kindIcon)
 	e.svg = s
 	if s != nil && s.h > 0 {
@@ -90,15 +90,26 @@ func Icon(c *Context, s *SVG) *Element {
 // Icon draws the shapes of an SVG fitted in r, in color c.
 func (p *Painter) Icon(s *SVG, r Rect, c Color) { p.drawIcon(s, r, c, 0) }
 
-// Rotate turns an Icon by degrees clockwise around its center, as a
-// spinner does:
+// Rotate rotates an element clockwise around its transform origin, which
+// changes no layout sizes. An Icon keeps turning its SVG artwork around its
+// center, as a spinner does:
 //
 //	spin := ui.Icon(c, loader)
 //	spin.Rotate(spin.Loop("spin", time.Second, ui.Linear) * 360)
-func (e *Element) Rotate(degrees float32) *Element { e.rotate = degrees; return e }
+//
+// Use Transform(Rotation(degrees)) to rotate an icon's entire border box.
+func (e *node) Rotate(degrees float32) *node {
+	finiteTransform(degrees)
+	if e.kind == kindIcon {
+		e.rotate = degrees
+	} else {
+		e.transform = e.transform.Then(Rotation(degrees))
+	}
+	return e
+}
 
 // Grayscale draws the element's image, or icon, in shades of gray.
-func (e *Element) Grayscale() *Element { e.gray = true; return e }
+func (e *node) Grayscale() *node { e.gray = true; return e }
 
 // svgs holds what the engine reuses to draw SVGs: the job of drawing an
 // icon's mask, the pixels it draws them into, and the pictures of SVGs
@@ -202,8 +213,9 @@ func (p *Painter) drawIcon(s *SVG, r Rect, c Color, rotate float32) {
 	}
 	x, y := d.X-float32((cw-w)/2), d.Y-float32((ch-h)/2)
 	start := int32(len(p.s.Glyphs))
-	p.s.Glyphs = append(p.s.Glyphs, scene.Glyph{X: x, Y: y, W: float32(gi.W), H: float32(gi.H), U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H, Color: c.Alpha(p.opacity).scene()})
-	p.s.Ops = append(p.s.Ops, scene.Op{Kind: scene.OpGlyphs, Start: start, End: start + 1})
+	c = c.Alpha(p.opacity)
+	p.s.Glyphs = append(p.s.Glyphs, scene.Glyph{X: x, Y: y, W: float32(gi.W), H: float32(gi.H), U: gi.X, V: gi.Y, UW: gi.W, VH: gi.H, Color: c.scene(), Wide: p.glyphWide(c)})
+	p.add(scene.Op{Kind: scene.OpGlyphs, Start: start, End: start + 1})
 }
 
 // rasterizeIcon draws the mask of the icon job: the coverage of its SVG,
@@ -256,14 +268,16 @@ func (p *Painter) drawSVG(s *SVG, box Rect, fit Fit, radius [4]float32, current 
 	if !s.doc.UsesCurrentColor() {
 		current = Color{}
 	}
-	img := p.rt.picture(pictureKey{s: s, w: w, h: h, color: current, stretch: fit == FillBox})
-	op := scene.Op{Kind: scene.OpImage, Rect: d, Radii: p.radii(radius), Image: img, Src: scene.Rect{W: float32(w), H: float32(h)}, Opacity: p.opacity, Grayscale: gray}
+	// Pictures are bitmaps in sRGB: current draws there as its nearest
+	// sRGB color.
+	img := p.rt.picture(pictureKey{s: s, w: w, h: h, color: current.SRGB(), stretch: fit == FillBox})
+	op := scene.Op{Kind: scene.OpImage, Rect: d, Radii: p.radii(radius), Continuous: continuousCorners, Image: img, Src: scene.Rect{W: float32(w), H: float32(h)}, Opacity: p.opacity, Grayscale: gray}
 	if fit == Cover || fit == NaturalSize {
 		// Only what falls in the box shows.
 		b := p.snap(box).Intersect(d)
 		op.Rect, op.Src = b, scene.Rect{X: b.X - d.X, Y: b.Y - d.Y, W: b.W, H: b.H}
 	}
-	p.s.Ops = append(p.s.Ops, op)
+	p.add(op)
 }
 
 // picture returns the picture of an SVG, drawing it unless a recent frame

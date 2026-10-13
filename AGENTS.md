@@ -21,8 +21,10 @@ wire protocol, TypeScript generation, and the checklist for adding features.
   (Vite, the mygo-cli package). Nothing in an app may need Bun at run time.
 - **Scope:** system webview on macOS, Linux and Windows (WebView2), and
   native UI that MyGo draws itself (`WindowOptions.Content`, package `ui`;
-  see "Native UI" in the architecture guide). The bundled CEF option is out
-  of scope until asked. Other platforms must keep compiling through
+  see "Native UI" in the architecture guide), which also runs in browsers
+  (`GOOS=js GOARCH=wasm`, `internal/web`, drawn with WebGL 2 by the GL
+  renderer; see "Browsers"). The bundled CEF option is out of scope until
+  asked. Other platforms must keep compiling through
   `internal/unsupported`.
 - **Great DX over Electron parity.** Keep the familiar feel (app lifecycle,
   windows, menus) but design Go-first APIs: typed IPC via `mygo.Bind` and
@@ -38,6 +40,8 @@ wire protocol, TypeScript generation, and the checklist for adding features.
 ```sh
 go build ./... && GOOS=linux go build ./... && GOOS=windows go build ./...  # all must pass
 go vet ./... && GOOS=linux go vet ./... && GOOS=windows go vet ./...
+go vet -tags mygo_noinspector ./...        # production builds, without the inspector of native UI
+GOOS=js GOARCH=wasm go vet $(GOOS=js GOARCH=wasm go list ./... | grep -v /cmd/mygo)  # browsers, all but the CLI
 go test ./...                              # core (fake backend), tsgen, CLI, accelerator
 MYGO_E2E=1 go test ./internal/e2e          # real GUI tests (macOS desktop session)
 bun install && bun run test && bun run typecheck   # the workspace, from the root
@@ -45,13 +49,19 @@ bun run build                              # build internal/bridge/bridge.js and
 bun run --cwd packages/cli binaries        # cross-compile the CLI into the mygo-cli platform packages
 go run ./cmd/mygo generate examples/todo   # regenerate an example's TypeScript client
 go run ./cmd/mygo dev examples/todo        # live reload (dev bundle in examples/todo/.mygo)
+go run ./cmd/mygo dev -web examples/counter-native   # native UI in the browser, with live reload
 go run ./cmd/mygo build examples/todo      # .app + .dmg in examples/todo/build
+go run ./cmd/mygo build -platform web examples/counter-native   # a static site in examples/counter-native/dist/web
 go run ./examples/gallery                  # the native UI toolkit's tour
+go run ./examples/code-editor              # the code editor and the diff viewer (ui/editor)
 go run ./examples/terminal                 # a terminal (downloads libghostty-vt once)
 go generate ./plugins/terminal             # build libghostty-vt for every platform (with Zig), write Ghostty's themes
 go generate ./internal/gpu/d3d11           # recompile the Direct3D shader (on Windows)
 go generate ./internal/gpu/metal           # recompile the Metal shader (on macOS, with Xcode)
+go generate ./plugins/glass                # recompile the glass plugin's shaders (on macOS, and on Windows)
 bun run --cwd website dev                  # the website, with docs/ at /docs (see website/README.md)
+bun scripts/bench.ts run [--e2e]           # benchmarks and app sizes, medians of 6 runs (CI: bench.yml, /benchmarks)
+go run ./internal/idlemem app...           # apps' memory once idle, with their webviews' processes
 ```
 
 Linux GUI tests cross-compile and run in a container with WebKitGTK and Xvfb;
@@ -60,9 +70,13 @@ Windows GUI tests need Windows with the WebView2 Runtime (a GitHub Actions
 
 ## Conventions
 
+- Never write `[skip ci]` (or `[ci skip]`, `[no ci]`) in a commit message,
+  not even quoted in its body: GitHub skips the push's workflows, CI and
+  benchmarks included, and Cloudflare the website's deploy. Only the
+  benchmarks branch's commits say it.
 - New behavior goes into `package mygo` first; backends only translate
   `internal/platform` calls to native ones. Implement every platform method in
-  `darwin`, `linux`, `windows`, `fake` and `unsupported`.
+  `darwin`, `linux`, `windows`, `web`, `fake` and `unsupported`.
 - Objective-C: `alloc`/`init` objects are owned and must be released; wrap
   temporary objects in `withPool`; copy blocks you call later.
 - Official plugins live in `plugins/<name>`: the Go package and its npm
@@ -71,7 +85,13 @@ Windows GUI tests need Windows with the WebView2 Runtime (a GitHub Actions
   package draws the update window in native UI. The terminal plugin is Go
   only too, for native UI, with libghostty-vt loaded through purego: its
   `mygo-plugin.json` pins the builds the CLI puts into apps, published as
-  release assets (`libghostty-vt-<commit>`); change it with `go generate`.
+  release assets (`libghostty-vt-<commit>`); change it with `go generate`. The glass
+  plugin is Go only too, an effect of the renderers (`scene.Effect`): its
+  shader in Metal, HLSL and GLSL with a CPU twin that must draw the same
+  pixels, compiled ahead of time by `go generate` on macOS and Windows.
+  The game plugin is Go only too, what games need beyond what apps do,
+  opt-in, kept out of core `ui`: a game loop and a camera for native UI,
+  and `plugins/game/gamepad`, which reads controllers.
 - The `dist/` of npm packages is not committed: run `bun run build` after
   `bun install` (CI and releases do). Commit `internal/bridge/bridge.js`
   whenever its sources change, and keep the generated clients of examples

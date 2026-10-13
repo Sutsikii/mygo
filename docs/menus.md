@@ -35,7 +35,8 @@ A `MenuItem` has:
 - `Label`, and an `Accelerator`, its keyboard shortcut (see
   [accelerators](#accelerators));
 - `Click`, called on the main thread when the item is chosen, with the item
-  and the focused window, or nil;
+  and, on Linux and Windows, the window whose menu bar or context menu was
+  chosen. Other menus use the focused window, or nil;
 - `Type`: `MenuItemNormal`, `MenuItemCheckbox`, `MenuItemRadio`,
   `MenuItemSeparator` or `MenuItemSubmenu`; items with a `Submenu` are
   submenus, others normal items unless set. Adjacent radio items form a
@@ -52,7 +53,8 @@ shortcut, which `Label` and `Accelerator` override:
 
 - editing: `RoleUndo`, `RoleRedo`, `RoleCut`, `RoleCopy`, `RolePaste`,
   `RoleDelete`, `RoleSelectAll`, and on macOS `RolePasteAndMatchStyle`;
-- the page: `RoleReload`, `RoleForceReload`, `RoleToggleDevTools`,
+- the page: `RoleReload`, `RoleForceReload`, `RoleToggleDevTools` (in a
+  window of native UI, its [inspector](ui/inspector.md)),
   `RoleResetZoom`, `RoleZoomIn`, `RoleZoomOut`;
 - the window: `RoleToggleFullScreen`, `RoleMinimize`, `RoleZoom`,
   `RoleClose`;
@@ -142,7 +144,7 @@ note.addEventListener("contextmenu", (e) => {
 
 Without a handler of their own, pages show the webview's standard context
 menu, with Copy and Paste on text and Inspect Element in development
-builds. Windows showing [native UI](ui.md#input) give elements context
+builds. Windows showing [native UI](ui/context-menu.md) give elements context
 menus with `ContextMenu`, built like the rest of their interface.
 
 ## The Dock menu
@@ -191,6 +193,12 @@ menu, clicks reach `OnClick`, and `OnRightClick` gets right-clicks. Change
 the tray with `SetIcon`, `SetMenu`, `SetToolTip` and, on macOS,
 `SetTitle`, the text next to the icon; `Destroy` removes it.
 
+`Tray.PopUpMenu` opens the menu set with `SetMenu` programmatically. On
+macOS, AppKit places it below the status item and highlights its button
+while the menu is open. To show a menu only on right-click while keeping
+primary clicks available, set the menu in `OnRightClick`, call
+`PopUpMenu`, then clear it with `SetMenu(nil)` when the call returns.
+
 On Linux tray icons use AppIndicator, which needs
 `libayatana-appindicator3`: they show a menu and report no clicks, and
 `NewTray` returns an error without the library.
@@ -200,6 +208,13 @@ Apps that live in the menu bar usually drop their Dock icon on macOS:
 ```go
 mygo.App.SetActivationPolicy(mygo.ActivationPolicyAccessory)
 ```
+
+For an icon that opens a window of native UI, see
+[the menu bar example](https://github.com/egoist/mygo/tree/main/examples/menubar-native).
+It leaves the tray menu unset on macOS and Windows, uses `OnClick` to
+toggle a frameless window positioned with `Tray.Bounds`, and hides it on
+`OnBlur` or Escape. On Linux, an AppIndicator menu item opens the same
+window.
 
 ## Accelerators
 
