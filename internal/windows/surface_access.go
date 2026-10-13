@@ -5,6 +5,7 @@ package windows
 import (
 	"math"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -16,9 +17,12 @@ import (
 // Automation. The surface's window answers WM_GETOBJECT with a fragment
 // root whose fragments are the nodes of the content's tree: COM objects
 // with the control patterns of their roles. Invoke presses buttons and
-// links, Toggle check boxes and switches, SelectionItem radio buttons;
-// RangeValue gives sliders and progress bars, Value text fields and
-// pop-up buttons, which ExpandCollapse opens.
+// links, Toggle check boxes and switches, SelectionItem radio buttons and
+// the rows lists choose, in the Selection of their list; RangeValue gives
+// sliders and progress bars, Value text fields and pop-up buttons, which
+// ExpandCollapse opens; ScrollItem scrolls what is in scroll containers
+// into view. Rows say which of all of their list's they are
+// (PositionInSet, SizeOfSet), as a list builds only those in view.
 //
 // Two methods take doubles, which Go callbacks cannot read: thunks in
 // assembly move their bits to integer registers first (uia_*.s).
@@ -69,6 +73,9 @@ const (
 	ifaceRangeValue
 	ifaceValue
 	ifaceExpandCollapse
+	ifaceSelection
+	ifaceScrollItem
+	ifaceHwndOverride
 	uiaIfaces
 )
 
@@ -82,14 +89,19 @@ var uiaIIDs = [uiaIfaces]GUID{
 	guid("36dc7aef-33e6-4691-afe1-2be7274b3d33"), // IRangeValueProvider
 	guid("c7935180-6fb3-4201-b174-7df73adbf64a"), // IValueProvider
 	guid("d847d3a5-cab0-4a98-8c32-ecb45c59ad24"), // IExpandCollapseProvider
+	guid("fb8b03af-3bdf-48d4-bd36-1a65793be168"), // ISelectionProvider
+	guid("2360c714-4bf1-4b26-ba65-9b21316127eb"), // IScrollItemProvider
+	guid("1d5df27c-8947-4425-b8d9-79787bb460b8"), // IRawElementProviderHwndOverride
 }
 
 // Pattern identifiers of UI Automation, by interface.
-var uiaPatterns = map[uintptr]int{10000: ifaceInvoke, 10002: ifaceValue, 10003: ifaceRangeValue,
-	10005: ifaceExpandCollapse, 10010: ifaceSelectionItem, 10015: ifaceToggle}
+var uiaPatterns = map[uintptr]int{10000: ifaceInvoke, 10001: ifaceSelection, 10002: ifaceValue, 10003: ifaceRangeValue,
+	10005: ifaceExpandCollapse, 10010: ifaceSelectionItem, 10015: ifaceToggle, 10017: ifaceScrollItem}
 
 const (
-	uiaRootObjectID = -25
+	uiaRootObjectID  = -25
+	objidClient      = -4
+	eventObjectFocus = 0x8005
 
 	uiaRuntimeIDProperty        = 30000
 	uiaControlTypeProperty      = 30003
@@ -99,6 +111,10 @@ const (
 	uiaIsFocusableProperty      = 30009
 	uiaIsEnabledProperty        = 30010
 	uiaHelpTextProperty         = 30013
+	uiaIsDataValidProperty      = 30103
+	uiaItemStatusProperty       = 30026
+	uiaLevelProperty            = 30154
+	uiaFullDescriptionProperty  = 30159
 	uiaIsPasswordProperty       = 30019
 	uiaFrameworkIDProperty      = 30024
 	uiaValueProperty            = 30045
@@ -107,14 +123,28 @@ const (
 	uiaIsSelectedProperty       = 30079
 	uiaToggleStateProperty      = 30086
 	uiaIsDialogProperty         = 30174
+	uiaHeadingLevelProperty     = 30173
+	uiaOrientationProperty      = 30023
+	uiaIsOffscreenProperty      = 30022
+	uiaPositionInSetProperty    = 30152
+	uiaSizeOfSetProperty        = 30153
+	uiaLiveSettingProperty      = 30135
 
-	uiaFocusChangedEvent = 20005
+	uiaFocusChangedEvent                = 20005
+	uiaElementAddedToSelectionEvent     = 20010
+	uiaElementRemovedFromSelectionEvent = 20011
+	uiaElementSelectedEvent             = 20012
+	uiaLiveRegionChangedEvent           = 20024
 
-	vtEmpty = 0
-	vtI4    = 3
-	vtR8    = 5
-	vtBSTR  = 8
-	vtBool  = 11
+	// announcerID identifies the live region holding announcements.
+	announcerID = ^uint64(0)
+
+	vtEmpty   = 0
+	vtI4      = 3
+	vtR8      = 5
+	vtBSTR    = 8
+	vtBool    = 11
+	vtUnknown = 13
 
 	uiaElementNotEnabled   = 0x80040200
 	uiaElementNotAvailable = 0x80040201
@@ -130,6 +160,11 @@ var uiaControlTypes = map[platform.AccessRole]int32{
 	platform.RolePopUpButton: 50003, platform.RoleTabList: 50018, platform.RoleTab: 50019, platform.RoleSplitter: 50038,
 	platform.RoleStatus: 50017, platform.RoleTable: 50036, platform.RoleRow: 50029, platform.RoleCell: 50025,
 	platform.RoleColumnHeader: 50035, platform.RoleTree: 50023, platform.RoleTreeItem: 50024,
+	platform.RoleListItem: 50007, platform.RoleMenuButton: 50000, platform.RoleToolbar: 50021, platform.RoleRadioGroup: 50026,
+	platform.RoleToggleButton: 50000, platform.RoleComboBox: 50003, platform.RoleDisclosure: 50000,
+	platform.RoleMeter: 50012, platform.RoleStepper: 50016, platform.RoleColorWell: 50000, platform.RoleAlertDialog: 50033,
+	platform.RoleMenu: 50009, platform.RoleMenuBar: 50010, platform.RoleMenuItem: 50011, platform.RoleMenuItemCheckBox: 50011,
+	platform.RoleMenuItemRadio: 50011, platform.RoleHeading: 50020,
 }
 
 // variant is VARIANT, with the value of the types used here.
@@ -170,6 +205,8 @@ type uiaTree struct {
 	order []*uiaElement // in the order of the content's tree
 	focus uint64
 	quiet bool // building the tree a client asked for
+	// announced is the text of the live region of announcements.
+	announced string
 }
 
 func (e *uiaElement) ptr(i int) uintptr { return uintptr(unsafe.Pointer(&e.ifaces[i])) }
@@ -203,7 +240,7 @@ func (e *uiaElement) supports(i int) bool {
 	switch i {
 	case ifaceSimple, ifaceFragment:
 		return true
-	case ifaceRoot:
+	case ifaceRoot, ifaceHwndOverride:
 		return e.root
 	}
 	if e.root {
@@ -212,20 +249,38 @@ func (e *uiaElement) supports(i int) bool {
 	switch i {
 	case ifaceInvoke:
 		switch n.Role {
-		case platform.RoleCheckBox, platform.RoleSwitch, platform.RoleRadio, platform.RolePopUpButton, platform.RoleTab:
+		case platform.RoleCheckBox, platform.RoleSwitch, platform.RoleRadio, platform.RolePopUpButton, platform.RoleTab, platform.RoleMenuButton,
+			platform.RoleToggleButton, platform.RoleDisclosure:
 			return false
 		}
 		return n.Actions&platform.ActionPress != 0
 	case ifaceToggle:
-		return n.Role == platform.RoleCheckBox || n.Role == platform.RoleSwitch
+		// Items of menus showing a choice toggle it, as WPF's checkable
+		// items, and are invoked as well.
+		return n.Role == platform.RoleCheckBox || n.Role == platform.RoleSwitch || n.Role == platform.RoleToggleButton ||
+			n.Role == platform.RoleMenuItemCheckBox || n.Role == platform.RoleMenuItemRadio
 	case ifaceSelectionItem:
-		return n.Role == platform.RoleRadio || n.Role == platform.RoleTab || n.Role == platform.RoleTreeItem || n.Role == platform.RoleRow
+		switch n.Role {
+		case platform.RoleRadio, platform.RoleTab, platform.RoleTreeItem:
+			return true
+		case platform.RoleListItem, platform.RoleRow:
+			return n.States&platform.AccessSelectable != 0
+		}
+		return false
+	case ifaceSelection:
+		// A list or table choosing its rows.
+		return (n.Role == platform.RoleList || n.Role == platform.RoleTable || n.Role == platform.RoleTree) && n.States&platform.AccessSelectable != 0
+	case ifaceScrollItem:
+		return n.Actions&platform.ActionScrollIntoView != 0
 	case ifaceRangeValue:
-		return n.Role == platform.RoleSlider || n.Role == platform.RoleProgress
+		return n.Role.Ranged()
 	case ifaceValue:
-		return n.Role == platform.RoleTextField || n.Role == platform.RolePopUpButton
+		return n.Role == platform.RoleTextField || n.Role == platform.RolePopUpButton || n.Role == platform.RoleComboBox ||
+			n.Role == platform.RoleColorWell
 	case ifaceExpandCollapse:
-		return n.Role == platform.RolePopUpButton || n.Role == platform.RoleTreeItem
+		// A menu button expands into its menu, as WinUI's DropDownButton.
+		return n.Role == platform.RolePopUpButton || n.Role == platform.RoleTreeItem || n.Role == platform.RoleMenuButton ||
+			n.Role == platform.RoleComboBox || n.Role == platform.RoleDisclosure
 	}
 	return false
 }
@@ -283,7 +338,12 @@ func (s *surface) accessRoot() *uiaElement {
 
 // getObject answers WM_GETOBJECT for UI Automation.
 func (s *surface) getObject(wp, lp uintptr) (uintptr, bool) {
-	if int32(uint32(lp)) != uiaRootObjectID || s.w.closed {
+	// UI Automation asks for the root (UiaRootObjectId), and, with object
+	// IDs from 0 up, for the elements whose events its clients receive:
+	// UiaReturnRawElementProvider answers both, and OBJID_CLIENT with the
+	// MSAA view of the tree. Other MSAA objects (the title bar, the
+	// scroll bars, …) are the window's.
+	if id := int32(uint32(lp)); id < 0 && id != uiaRootObjectID && id != objidClient || s.w.closed {
 		return 0, false
 	}
 	root := s.accessRoot()
@@ -329,6 +389,18 @@ func listening() bool {
 }
 
 func (t *uiaTree) update(tree *platform.AccessTree) {
+	// Announcements go into a polite live region at the end of the tree,
+	// whose LiveRegionChanged screen readers read, as Flutter's alerts:
+	// notification events (UiaRaiseNotificationEvent), which a provider of
+	// another process raises, reached no client in tests, unlike its other
+	// events.
+	if len(tree.Announcements) > 0 {
+		t.announced = strings.Join(tree.Announcements, " ")
+	}
+	if t.announced != "" {
+		announcer := platform.AccessNode{ID: announcerID, Parent: -1, Role: platform.RoleText, Label: t.announced, Bounds: platform.RectF{W: 1, H: 1}}
+		tree = &platform.AccessTree{Nodes: append(slices.Clip(tree.Nodes), announcer), Focus: tree.Focus, Announcements: tree.Announcements}
+	}
 	notify := !t.quiet && listening()
 	old := t.nodes
 	t.nodes = make(map[uint64]*uiaElement, len(tree.Nodes))
@@ -400,7 +472,13 @@ func (t *uiaTree) update(tree *platform.AccessTree) {
 		t.focus = tree.Focus
 		if e := t.nodes[t.focus]; e != nil && notify {
 			procUiaRaiseAutomationEvent.Call(e.ptr(ifaceSimple), uiaFocusChangedEvent)
+			// Clients that follow the focus through WinEvents, as those of
+			// System.Windows.Automation, then ask the window for it.
+			procNotifyWinEvent.Call(eventObjectFocus, t.s.hwnd, uintptr(objidClient&0xffffffff), 0)
 		}
+	}
+	if e := t.nodes[announcerID]; e != nil && notify && len(tree.Announcements) > 0 {
+		procUiaRaiseAutomationEvent.Call(e.ptr(ifaceSimple), uiaLiveRegionChangedEvent)
 	}
 }
 
@@ -432,6 +510,20 @@ func (e *uiaElement) notifyChanges(prev platform.AccessNode) {
 	case e.supports(ifaceSelectionItem):
 		if before, after := prev.States&platform.AccessChecked != 0, n.States&platform.AccessChecked != 0; before != after {
 			changed(uiaIsSelectedProperty, boolVariant(before), boolVariant(after))
+			// A row of a list choosing several joins the choice or leaves
+			// it, unless it is now the only one.
+			event := uintptr(uiaElementSelectedEvent)
+			if c := e.container(); c != nil && c.n.States&platform.AccessMultiselectable != 0 {
+				switch {
+				case !after:
+					event = uiaElementRemovedFromSelectionEvent
+				case len(c.chosen()) > 1:
+					event = uiaElementAddedToSelectionEvent
+				}
+			}
+			if after || event != uiaElementSelectedEvent {
+				procUiaRaiseAutomationEvent.Call(e.ptr(ifaceSimple), event)
+			}
 		}
 	case e.supports(ifaceRangeValue):
 		if prev.Now != n.Now {
@@ -447,6 +539,15 @@ func (e *uiaElement) notifyChanges(prev platform.AccessNode) {
 	}
 }
 
+// smallChange returns how far the arrow keys move the value of a range:
+// its step, else a hundredth of it.
+func smallChange(n platform.AccessNode) float64 {
+	if n.Step > 0 {
+		return n.Step
+	}
+	return (n.Max - n.Min) / 100
+}
+
 func toggleState(n platform.AccessNode) int32 {
 	switch {
 	case n.States&platform.AccessMixed != 0:
@@ -458,8 +559,11 @@ func toggleState(n platform.AccessNode) int32 {
 }
 
 func expandState(n platform.AccessNode) int32 {
-	if n.States&platform.AccessExpanded != 0 {
+	switch {
+	case n.States&platform.AccessExpanded != 0:
 		return 1 // ExpandCollapseState_Expanded
+	case n.Role == platform.RoleTreeItem && n.States&platform.AccessExpandable == 0:
+		return 3 // ExpandCollapseState_LeafNode
 	}
 	return 0
 }
@@ -541,14 +645,24 @@ func initUIA() {
 		return e, sOK
 	}
 
+	// The node of a web view's page is WebView2's provider of the page,
+	// in the place of the window WebView2 shows it with (ifaceHwndOverride):
+	// it answers with that provider (pageCall), and has no runtime
+	// identifier of its own.
 	uiaVtbls[ifaceSimple] = vtbl(
 		cb(func(this, p uintptr) uintptr { // get_ProviderOptions
+			if hr, ok := uiaOf(this).pageCall(uiaGetProviderOptions, p); ok {
+				return hr
+			}
 			*(*int32)(native(p)) = 0x1 | 0x20 // ServerSideProvider, UseComThreading
 			return sOK
 		}),
 		cb(func(this, pattern, p uintptr) uintptr { // GetPatternProvider
 			e, hr := live(this)
 			if e == nil {
+				return hr
+			}
+			if hr, ok := e.pageCall(uiaGetPatternProvider, pattern, p); ok && hr != eNotImpl {
 				return hr
 			}
 			if i, ok := uiaPatterns[pattern]; ok && e.supports(i) {
@@ -563,6 +677,9 @@ func initUIA() {
 			if e == nil {
 				return hr
 			}
+			if hr, ok := e.pageCall(uiaGetPropertyValue, property, p); ok && hr != eNotImpl {
+				return hr
+			}
 			e.property(int(property), v)
 			return sOK
 		}),
@@ -571,6 +688,9 @@ func initUIA() {
 			if e.root && !e.dead {
 				r, _, _ := procUiaHostProviderFromHwnd.Call(e.tree.s.hwnd, p)
 				return r
+			}
+			if hr, ok := e.pageCall(uiaGetHostRawElementProvider, p); ok {
+				return hr
 			}
 			return out(p, nil, 0)
 		}),
@@ -620,7 +740,7 @@ func initUIA() {
 				return hr
 			}
 			id := e.runtimeID()
-			if id == nil {
+			if id == nil || e.page() != nil { // a page's is its window's
 				return sOK
 			}
 			sa, _, _ := procSafeArrayCreateVector.Call(vtI4, 0, uintptr(len(id)))
@@ -650,6 +770,10 @@ func initUIA() {
 			e, hr := live(this)
 			if e == nil {
 				return hr
+			}
+			if v := e.page(); v != nil {
+				v.focusWebView()
+				return sOK
 			}
 			procSetFocus.Call(e.tree.s.hwnd)
 			if e.root || e.n.Actions&platform.ActionFocus == 0 {
@@ -682,6 +806,17 @@ func initUIA() {
 		return e.setRangeValue(math.Float64frombits(uint64(v)))
 	})
 	fromPoint, setValue := uiaThunks()
+
+	uiaVtbls[ifaceHwndOverride] = vtbl(
+		cb(func(this, hwnd, p uintptr) uintptr { // GetOverrideProviderForHwnd
+			e, hr := live(this)
+			*(*uintptr)(native(p)) = 0
+			if e == nil {
+				return hr
+			}
+			return out(p, e.tree.pageOfWindow(hwnd), ifaceSimple)
+		}),
+	)
 
 	uiaVtbls[ifaceRoot] = vtbl(
 		fromPoint,
@@ -727,7 +862,54 @@ func initUIA() {
 			setBool(p, selected(uiaOf(this)))
 			return sOK
 		}),
-		cb(func(this, p uintptr) uintptr { return out(p, nil, 0) }), // get_SelectionContainer
+		cb(func(this, p uintptr) uintptr { // get_SelectionContainer
+			e, hr := live(this)
+			if e == nil {
+				return hr
+			}
+			return out(p, e.container(), ifaceSimple)
+		}),
+	)
+
+	uiaVtbls[ifaceSelection] = vtbl(
+		cb(func(this, p uintptr) uintptr { // GetSelection
+			e, hr := live(this)
+			*(*uintptr)(native(p)) = 0
+			if e == nil {
+				return hr
+			}
+			chosen := e.chosen()
+			sa, _, _ := procSafeArrayCreateVector.Call(vtUnknown, 0, uintptr(len(chosen)))
+			for i, d := range chosen {
+				index := int32(i)
+				procSafeArrayPutElement.Call(sa, uintptr(unsafe.Pointer(&index)), d.ptr(ifaceSimple))
+			}
+			*(*uintptr)(native(p)) = sa
+			return sOK
+		}),
+		cb(func(this, p uintptr) uintptr { // get_CanSelectMultiple
+			e, hr := live(this)
+			if e == nil {
+				setBool(p, false)
+				return hr
+			}
+			setBool(p, e.n.States&platform.AccessMultiselectable != 0)
+			return sOK
+		}),
+		cb(func(this, p uintptr) uintptr { // get_IsSelectionRequired
+			setBool(p, false)
+			return sOK
+		}),
+	)
+
+	uiaVtbls[ifaceScrollItem] = vtbl(
+		cb(func(this uintptr) uintptr { // ScrollIntoView
+			e, hr := live(this)
+			if e == nil {
+				return hr
+			}
+			return e.act(platform.AccessScrollIntoView, "")
+		}),
 	)
 
 	rangeOf := func(get func(n platform.AccessNode) float64) uintptr {
@@ -745,8 +927,8 @@ func initUIA() {
 		}),
 		rangeOf(func(n platform.AccessNode) float64 { return n.Max }),
 		rangeOf(func(n platform.AccessNode) float64 { return n.Min }),
-		rangeOf(func(n platform.AccessNode) float64 { return (n.Max - n.Min) / 10 }),  // LargeChange
-		rangeOf(func(n platform.AccessNode) float64 { return (n.Max - n.Min) / 100 }), // SmallChange, as the arrow keys
+		rangeOf(func(n platform.AccessNode) float64 { return max(smallChange(n), (n.Max-n.Min)/10) }), // LargeChange, as Page Up and Down
+		rangeOf(smallChange), // SmallChange, as the arrow keys
 	)
 
 	uiaVtbls[ifaceValue] = vtbl(
@@ -775,6 +957,13 @@ func initUIA() {
 			e, hr := live(this)
 			if e == nil || (e.n.States&platform.AccessExpanded != 0) == open {
 				return hr
+			}
+			if e.n.Actions&platform.ActionExpand != 0 {
+				// An item of a tree, which pressing chooses.
+				if !open {
+					return e.act(platform.AccessCollapse, "")
+				}
+				return e.act(platform.AccessExpand, "")
 			}
 			return e.act(platform.AccessPress, "")
 		})
@@ -821,10 +1010,18 @@ func (e *uiaElement) property(id int, v *variant) {
 		switch n.Role {
 		case platform.RoleSwitch:
 			str("toggle switch")
+		case platform.RoleMenuButton:
+			str("menu button")
+		case platform.RoleRadioGroup:
+			str("radio group")
 		case platform.RoleDialog:
 			str("dialog")
+		case platform.RoleAlertDialog:
+			str("alert dialog")
 		case platform.RolePopup:
 			str("popup")
+		case platform.RoleHeading:
+			str("heading")
 		}
 	case uiaNameProperty:
 		str(n.Label)
@@ -835,12 +1032,150 @@ func (e *uiaElement) property(id int, v *variant) {
 	case uiaIsEnabledProperty:
 		*v = boolVariant(n.States&platform.AccessDisabled == 0)
 	case uiaHelpTextProperty:
-		str(n.Placeholder)
+		// The placeholder of a text field, else the description, as
+		// Chromium's.
+		if n.Placeholder != "" {
+			str(n.Placeholder)
+		} else {
+			str(n.Description)
+		}
+	case uiaFullDescriptionProperty:
+		str(n.Description)
+	case uiaItemStatusProperty:
+		// The order of the column a table is sorted by, as Chromium says.
+		switch {
+		case n.States&platform.AccessSortAscending != 0:
+			str("ascending")
+		case n.States&platform.AccessSortDescending != 0:
+			str("descending")
+		}
+	case uiaIsDataValidProperty:
+		*v = boolVariant(n.States&platform.AccessInvalid == 0)
 	case uiaIsPasswordProperty:
 		*v = boolVariant(n.States&platform.AccessPassword != 0)
 	case uiaFrameworkIDProperty:
 		str("MyGo")
 	case uiaIsDialogProperty:
-		*v = boolVariant(n.Role == platform.RoleDialog)
+		*v = boolVariant(n.Role == platform.RoleDialog || n.Role == platform.RoleAlertDialog)
+	case uiaIsOffscreenProperty:
+		*v = boolVariant(n.States&platform.AccessOffscreen != 0)
+	case uiaOrientationProperty:
+		// OrientationType_Horizontal or Vertical, of a slider.
+		if n.Role == platform.RoleSlider {
+			o := uint64(1)
+			if n.States&platform.AccessVertical != 0 {
+				o = 2
+			}
+			*v = variant{VT: vtI4, Val: o}
+		}
+	case uiaHeadingLevelProperty:
+		// HeadingLevel1 to HeadingLevel9, as Chromium's headings.
+		if n.Role == platform.RoleHeading && n.Level > 0 {
+			*v = variant{VT: vtI4, Val: uint64(80050 + min(n.Level, 9))}
+		}
+	case uiaLevelProperty:
+		if n.Level > 0 && n.Role != platform.RoleHeading {
+			*v = variant{VT: vtI4, Val: uint64(n.Level)}
+		}
+	case uiaPositionInSetProperty:
+		if n.PosInSet > 0 {
+			*v = variant{VT: vtI4, Val: uint64(n.PosInSet)}
+		}
+	case uiaSizeOfSetProperty:
+		if n.SetSize > 0 {
+			*v = variant{VT: vtI4, Val: uint64(n.SetSize)}
+		}
+	case uiaLiveSettingProperty:
+		// Statuses, as toasts, and announcements are polite live regions.
+		if n.Role == platform.RoleStatus || n.ID == announcerID {
+			*v = variant{VT: vtI4, Val: 1} // Polite
+		}
 	}
+}
+
+// chosen returns the elements chosen in the element's Selection.
+func (e *uiaElement) chosen() []*uiaElement {
+	var chosen []*uiaElement
+	for _, d := range e.tree.order {
+		if d.n.States&platform.AccessChecked != 0 && d.supports(ifaceSelectionItem) && d.container() == e {
+			chosen = append(chosen, d)
+		}
+	}
+	return chosen
+}
+
+// container returns the element whose Selection holds the element's, the
+// list or table around it choosing it.
+func (e *uiaElement) container() *uiaElement {
+	for p := e.parent; p != nil && !p.root; p = p.parent {
+		if p.supports(ifaceSelection) {
+			return p
+		}
+	}
+	return nil
+}
+
+// The methods of IRawElementProviderSimple.
+const (
+	uiaGetProviderOptions        = 3
+	uiaGetPatternProvider        = 4
+	uiaGetPropertyValue          = 5
+	uiaGetHostRawElementProvider = 6
+)
+
+// page returns the web view whose page the element stands for, if any.
+func (e *uiaElement) page() *window {
+	v, ok := e.n.WebView.(*window)
+	if !ok || v.closed || v.comp == 0 || v.host == nil || v.host.surface != e.tree.s {
+		return nil
+	}
+	return v
+}
+
+// pageCall calls a method of WebView2's provider of the page the element
+// stands for, and reports whether it is one's.
+func (e *uiaElement) pageCall(method int, args ...uintptr) (uintptr, bool) {
+	v := e.page()
+	if v == nil || e.dead {
+		return 0, false
+	}
+	p := v.automationProvider()
+	if p == 0 {
+		return 0, false
+	}
+	simple := queryInterface(p, &uiaIIDs[ifaceSimple])
+	if simple == 0 {
+		return 0, false
+	}
+	defer release(simple)
+	return comCall(simple, method, args...), true
+}
+
+// pageOfWindow returns the node of the page that WebView2 shows with the
+// window hwnd, a child of the surface's, if one does.
+func (t *uiaTree) pageOfWindow(hwnd uintptr) *uiaElement {
+	env4 := queryInterface(t.s.w.b.env, &iidICoreWebView2Environment4)
+	if env4 == 0 {
+		return nil
+	}
+	defer release(env4)
+	var p uintptr
+	if failed(comCall(env4, env4GetAutomationProviderForWindow, hwnd, uintptr(unsafe.Pointer(&p)))) || p == 0 {
+		return nil
+	}
+	defer release(p)
+	want := queryInterface(p, &iidIUnknown)
+	defer release(want)
+	for _, e := range t.order {
+		if v := e.page(); v != nil {
+			if q := v.automationProvider(); q != 0 {
+				got := queryInterface(q, &iidIUnknown)
+				release(got)
+				if got == want {
+					return e
+				}
+			}
+		}
+	}
+	return nil
 }

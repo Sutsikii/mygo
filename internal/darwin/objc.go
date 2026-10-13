@@ -7,6 +7,7 @@ package darwin
 import (
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"unsafe"
 
@@ -38,10 +39,13 @@ var (
 	msgSetFloat      func(obj id, sel objc.SEL, v float64)
 	msgSize          func(obj id, sel objc.SEL) NSSize
 	msgSetSize       func(obj id, sel objc.SEL, s NSSize)
+	msgSuperSetSize  func(sup uintptr, sel objc.SEL, s NSSize)
+	msgSuperPoint    func(sup uintptr, sel objc.SEL, p NSPoint) id
 	msgPoint         func(obj id, sel objc.SEL) NSPoint
 	msgSetPoint      func(obj id, sel objc.SEL, p NSPoint)
 	msgInitRect      func(obj id, sel objc.SEL, r NSRect) id
 	msgInitRectID    func(obj id, sel objc.SEL, r NSRect, a id) id
+	msgRectIDUint    func(obj id, sel objc.SEL, r NSRect, a id, n uint)
 	msgInitIDPoint   func(obj id, sel objc.SEL, a id, p NSPoint) id
 	msgInitWindow    func(obj id, sel objc.SEL, r NSRect, style uint, backing uint, deferFlag bool) id
 	msgColor         func(cls id, sel objc.SEL, r, g, b, a float64) id
@@ -127,10 +131,13 @@ func load() {
 		purego.RegisterFunc(&msgSetFloat, msgSendAddr)
 		purego.RegisterFunc(&msgSize, msgSendAddr)
 		purego.RegisterFunc(&msgSetSize, msgSendAddr)
+		purego.RegisterFunc(&msgSuperSetSize, msgSendSuperAddr)
+		purego.RegisterFunc(&msgSuperPoint, msgSendSuperAddr)
 		purego.RegisterFunc(&msgPoint, msgSendAddr)
 		purego.RegisterFunc(&msgSetPoint, msgSendAddr)
 		purego.RegisterFunc(&msgInitRect, msgSendAddr)
 		purego.RegisterFunc(&msgInitRectID, msgSendAddr)
+		purego.RegisterFunc(&msgRectIDUint, msgSendAddr)
 		purego.RegisterFunc(&msgInitIDPoint, msgSendAddr)
 		purego.RegisterFunc(&msgInitWindow, msgSendAddr)
 		purego.RegisterFunc(&msgColor, msgSendAddr)
@@ -153,9 +160,10 @@ func load() {
 }
 
 var (
-	selMu    sync.RWMutex
-	selCache = map[string]objc.SEL{}
-	clsCache = map[string]id{}
+	selMu      sync.RWMutex
+	selCache   = map[string]objc.SEL{}
+	clsCache   = map[string]id{}
+	superCache = map[string]id{}
 )
 
 // sel returns the selector for name, cached.
@@ -234,24 +242,62 @@ type objcSuper struct {
 	superClass id
 }
 
+// superOf returns the struct objc_super that calls the superclass of
+// className with self, pinned until pin is unpinned: passed as an integer,
+// it must stay off the stack, which may move. The superclass is resolved
+// from className rather than from the object's class, which the runtime may
+// replace with a generated subclass (key-value observing does): resolving
+// "super" from it would call the override again and recurse forever.
+func superOf(self id, className string, pin *runtime.Pinner) uintptr {
+	sup := &objcSuper{receiver: self, superClass: superclass(className)}
+	pin.Pin(sup)
+	return uintptr(unsafe.Pointer(sup))
+}
+
+// superclass returns the superclass of a class, cached: overrides call it
+// as often as AppKit calls them, as setFrameSize: while a window resizes.
+func superclass(name string) id {
+	selMu.RLock()
+	c, ok := superCache[name]
+	selMu.RUnlock()
+	if ok {
+		return c
+	}
+	c = id(objc.Class(class(name)).SuperClass())
+	selMu.Lock()
+	superCache[name] = c
+	selMu.Unlock()
+	return c
+}
+
 // sendSuper calls the superclass implementation of a method overridden in
-// className. The superclass is resolved from className rather than from the
-// object's class, which the runtime may replace with a generated subclass
-// (key-value observing does): resolving "super" from it would call the
-// override again and recurse forever.
+// className (see superOf).
 //
 //go:uintptrescapes
 func sendSuper(self id, className string, s objc.SEL, args ...uintptr) id {
-	sup := &objcSuper{receiver: self, superClass: id(objc.Class(class(className)).SuperClass())}
-	// Passed as an integer: pinning keeps it off the stack, which may move.
 	var pin runtime.Pinner
-	pin.Pin(sup)
 	defer pin.Unpin()
 	var a [10]uintptr
-	a[0], a[1] = uintptr(unsafe.Pointer(sup)), uintptr(s)
+	a[0], a[1] = superOf(self, className, &pin), uintptr(s)
 	n := copy(a[2:], args)
 	r, _, _ := purego.SyscallN(msgSendSuperAddr, a[:n+2]...)
 	return id(r)
+}
+
+// sendSuperSize is sendSuper for a method taking an NSSize, which travels in
+// floating-point registers and so cannot go through the integer arguments.
+func sendSuperSize(self id, className string, s objc.SEL, size NSSize) {
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	msgSuperSetSize(superOf(self, className, &pin), s, size)
+}
+
+// sendSuperPoint is sendSuper for a method taking an NSPoint and
+// returning an object, as hitTest:.
+func sendSuperPoint(self id, className string, s objc.SEL, p NSPoint) id {
+	var pin runtime.Pinner
+	defer pin.Unpin()
+	return msgSuperPoint(superOf(self, className, &pin), s, p)
 }
 
 func respondsTo(obj id, selector string) bool {
@@ -300,8 +346,13 @@ func alloc(className string) id {
 	return send(send(class(className), "alloc"), "init")
 }
 
-// withPool runs fn inside an autorelease pool.
+// withPool runs fn inside an autorelease pool. A pool belongs to the thread
+// that pushed it, and popping it on another one crashes, so the goroutine
+// stays on its thread meanwhile: off the main thread, where public methods
+// such as App.Name read the bundle, it would move between threads.
 func withPool(fn func()) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	pool, _, _ := purego.SyscallN(poolPushFn)
 	defer purego.SyscallN(poolPopFn, pool)
 	fn()
@@ -356,6 +407,26 @@ func goBytes(data id) []byte {
 }
 
 func nsURL(s string) id { return send(class("NSURL"), "URLWithString:", uintptr(nsString(s))) }
+
+// filePathURLBytes resolves a file reference URL (file:///.file/id=…,
+// which Finder puts on the pasteboard when it drags or copies files) to a
+// file URL of its path. Other URLs come back unchanged.
+func filePathURLBytes(b []byte) []byte {
+	s := strings.TrimRight(string(b), "\x00")
+	if !strings.HasPrefix(s, "file:///.file/") {
+		return b
+	}
+	u := nsURL(s)
+	if u == 0 {
+		return b
+	}
+	if p := send(u, "filePathURL"); p != 0 {
+		if r := goString(send(p, "absoluteString")); r != "" {
+			return []byte(r)
+		}
+	}
+	return b
+}
 
 func fileURL(path string) id {
 	return send(class("NSURL"), "fileURLWithPath:", uintptr(nsString(path)))

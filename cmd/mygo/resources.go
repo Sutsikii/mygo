@@ -27,6 +27,12 @@ const resourcesDir = "resources"
 // bundleIcon is the file name of the icon in Contents/Resources.
 const bundleIcon = "AppIcon.icns"
 
+// bundleIconName is the name of the app icon in the asset catalog.
+const bundleIconName = "AppIcon"
+
+// bundleCatalog is the file name of the asset catalog in Contents/Resources.
+const bundleCatalog = "Assets.car"
+
 // Platform directories are named after a system MyGo builds apps for,
 // alone or with an architecture: darwin, linux-arm64, windows-amd64.
 var (
@@ -105,6 +111,12 @@ type resource struct {
 // as macOS and Windows do, and top-level names must differ from reserved,
 // the files the packaging adds itself.
 func (c *Config) resources(goos, goarch string, reserved ...string) ([]resource, error) {
+	return c.resourcesWith(goos, goarch, nil, reserved...)
+}
+
+// resourcesWith is resources with the native libraries of the app's
+// packages (see natives), installed at the top like listed resources.
+func (c *Config) resourcesWith(goos, goarch string, natives []source, reserved ...string) ([]resource, error) {
 	m := &merger{c: c, reserved: map[string]string{}}
 	for _, name := range reserved {
 		m.reserved[strings.ToLower(name)] = name
@@ -177,6 +189,7 @@ func (c *Config) resources(goos, goarch string, reserved ...string) ([]resource,
 		}
 		top = append(top, source{name: filepath.Base(src), path: src, listed: true})
 	}
+	top = append(top, natives...)
 	if err := m.merge(top); err != nil {
 		return nil, err
 	}
@@ -517,6 +530,9 @@ func sameContents(a, b string) (bool, error) {
 func reservedNames(c *Config, goos string) []string {
 	switch goos {
 	case "darwin":
+		if c.MacOS.Icon != "" {
+			return []string{bundleIcon, bundleCatalog}
+		}
 		return []string{bundleIcon}
 	case "windows":
 		return []string{c.executableName() + ".exe"}
@@ -612,7 +628,7 @@ func (r resource) walk(fn func(path string, info fs.FileInfo) error) error {
 		if err := fn(path, info); err != nil || !info.IsDir() {
 			return err
 		}
-		entries, err := os.ReadDir(path)
+		entries, err := readDir(path)
 		if err != nil {
 			return err
 		}

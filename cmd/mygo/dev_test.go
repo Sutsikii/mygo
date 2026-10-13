@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -29,29 +28,16 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
-	mode := os.Getenv("MYGO_FAKE_APP")
-	if mode == "relaunch" {
-		// mygo.App.Relaunch the first time, then like "ready".
-		marker := os.Getenv("MYGO_FAKE_MARKER")
-		if _, err := os.Stat(marker); err != nil {
-			_ = os.WriteFile(marker, nil, 0o644)
-			os.Exit(devRelaunchCode)
-		}
-		mode = "ready"
-	}
-	switch mode {
+	switch os.Getenv("MYGO_FAKE_APP") {
 	case "":
 		os.Exit(m.Run())
-	case "ready":
-		// Like the mygo package: report ready, run until SIGTERM.
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGTERM)
-		conn, err := net.Dial("unix", os.Getenv("MYGO_READY_SOCKET"))
-		if err != nil {
+	case "run":
+		// Like an app mygo dev launched: run until SIGTERM.
+		if os.Getenv("MYGO_DEV") != "1" {
 			os.Exit(2)
 		}
-		_, _ = conn.Write([]byte("ready\n"))
-		conn.Close()
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGTERM)
 		<-sig
 		os.Exit(0)
 	case "exit":
@@ -88,40 +74,45 @@ func TestDevLaunch(t *testing.T) {
 	}
 	defer func(d time.Duration) { stopGrace = d }(stopGrace)
 	stopGrace = 5 * time.Second // exiting takes a while under the race detector
-	s := &devSession{root: t.TempDir(), readyTimeout: 5 * time.Second}
-	ctx := context.Background()
+	s := &devSession{root: t.TempDir()}
 
-	t.Setenv("MYGO_FAKE_APP", "ready")
-	p, err := s.launch(ctx, os.Args[0])
+	t.Setenv("MYGO_FAKE_APP", "run")
+	p, err := s.launch(os.Args[0])
 	if err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-p.done:
+		t.Fatalf("the build exited: %v", p.err)
+	case <-time.After(200 * time.Millisecond):
 	}
 	p.stop()
 	if p.err != nil {
 		t.Errorf("a stopped build should quit cleanly: %v", p.err)
 	}
 
-	// A build that relaunches itself before it is ready starts again.
-	t.Setenv("MYGO_FAKE_APP", "relaunch")
-	t.Setenv("MYGO_FAKE_MARKER", filepath.Join(t.TempDir(), "launched"))
-	p, err = s.launch(ctx, os.Args[0])
-	if err != nil {
-		t.Fatalf("relaunch: %v", err)
-	}
-	p.stop()
-
+	// A build that exits on its own, as one that crashes, is noticed.
 	t.Setenv("MYGO_FAKE_APP", "exit")
-	if _, err := s.launch(ctx, os.Args[0]); err == nil || !strings.Contains(err.Error(), "exited before it was ready: exit status 3") {
-		t.Errorf("early exit: %v", err)
+	if p, err = s.launch(os.Args[0]); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-p.done:
+		if p.err == nil || !strings.Contains(p.err.Error(), "exit status 3") {
+			t.Errorf("exit: %v", p.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the exit of a build went unnoticed")
 	}
 
+	// One that ignores SIGTERM is killed.
 	t.Setenv("MYGO_FAKE_APP", "hang")
-	s.readyTimeout = 300 * time.Millisecond
+	if p, err = s.launch(os.Args[0]); err != nil {
+		t.Fatal(err)
+	}
 	stopGrace = 200 * time.Millisecond
 	start := time.Now()
-	if _, err := s.launch(ctx, os.Args[0]); err == nil || !strings.Contains(err.Error(), "did not get ready") {
-		t.Errorf("hang: %v", err)
-	}
+	p.stop()
 	if d := time.Since(start); d > 3*time.Second {
 		t.Errorf("a hanging build took %v to be killed", d)
 	}
@@ -129,23 +120,48 @@ func TestDevLaunch(t *testing.T) {
 
 func TestWatcher(t *testing.T) {
 	dir := t.TempDir()
-	file := filepath.Join(dir, "main.go")
-	if err := os.WriteFile(file, []byte("package main"), 0o644); err != nil {
-		t.Fatal(err)
+	// put writes a file in dir at once, as editors save files: the watcher
+	// must not see it, or the directories made for it, half written, which
+	// it reports as a change of its own when the writing takes longer than
+	// an interval, as it may on a busy machine.
+	put := func(name, content string) {
+		t.Helper()
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		top := path // the first part of the path that does not exist yet
+		for p := filepath.Dir(path); !fileExists(p); p = filepath.Dir(p) {
+			top = p
+		}
+		staged := filepath.Join(t.TempDir(), filepath.Base(top))
+		rel, err := filepath.Rel(top, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writeFiles(t, staged, map[string]string{filepath.ToSlash(rel): content})
+		if err := os.Rename(staged, top); err != nil {
+			t.Fatal(err)
+		}
 	}
+	put("main.go", "package main")
 	w := &watcher{}
 	w.set(&buildInputs{sourceDirs: []string{dir}})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	changes := w.watch(ctx, 20*time.Millisecond)
+	var reported []string // the paths of the last change
 	expect := func(changed bool, what string) {
 		t.Helper()
+		wait := 300 * time.Millisecond
+		if changed {
+			// Loaded CI runners can delay polling; unchanged-input checks
+			// still need only the short window to detect spurious events.
+			wait = 3 * time.Second
+		}
 		select {
-		case <-changes:
+		case reported = <-changes:
 			if !changed {
 				t.Fatalf("%s: change reported", what)
 			}
-		case <-time.After(300 * time.Millisecond):
+		case <-time.After(wait):
 			if changed {
 				t.Fatalf("%s: change not reported", what)
 			}
@@ -153,27 +169,40 @@ func TestWatcher(t *testing.T) {
 	}
 	expect(false, "nothing")
 	for _, f := range []string{"main_test.go", "notes.txt", "web.ts"} {
-		if err := os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o644); err != nil {
-			t.Fatal(err)
-		}
+		put(f, "x")
 	}
 	expect(false, "files the build ignores")
-	if err := os.WriteFile(file, []byte("package main // edited"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	put("main.go", "package main // edited")
 	expect(true, "edited source")
-	if err := os.WriteFile(filepath.Join(dir, "new.go"), []byte("package main"), 0o644); err != nil {
-		t.Fatal(err)
+	if want := []string{filepath.Join(dir, "main.go")}; !slices.Equal(reported, want) {
+		t.Errorf("edited source: reported %v, want %v", reported, want)
 	}
+	put("new.go", "package main")
 	expect(true, "new source")
+	if want := []string{filepath.Join(dir, "new.go")}; !slices.Equal(reported, want) {
+		t.Errorf("new source: reported %v, want %v", reported, want)
+	}
 
 	// An edit made while a build runs is not lost when the build hands
 	// over the same inputs.
-	if err := os.WriteFile(file, []byte("package main // edited during a build"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	put("main.go", "package main // edited during a build")
 	w.set(&buildInputs{sourceDirs: []string{dir}})
 	expect(true, "edit during a build")
+
+	// The directories of embedded files are watched whole, but for the
+	// Windows resources that builds write into the main package.
+	w.set(&buildInputs{sourceDirs: []string{dir}, fileDirs: []string{dir}})
+	expect(false, "embedded files")
+	put("mygo_windows_amd64.syso", "x")
+	expect(false, "resources of a build")
+	if err := os.Remove(filepath.Join(dir, "mygo_windows_amd64.syso")); err != nil {
+		t.Fatal(err)
+	}
+	expect(false, "resources of a build removed")
+	put("index.html", "x")
+	expect(true, "new embedded file")
+	w.set(&buildInputs{sourceDirs: []string{dir}})
+	expect(false, "new inputs")
 
 	// Resources are watched whole, and may not exist yet, but for the
 	// platform directories of other platforms, which development builds
@@ -181,21 +210,22 @@ func TestWatcher(t *testing.T) {
 	res := filepath.Join(dir, "resources")
 	w.set(&buildInputs{sourceDirs: []string{dir}, resources: res})
 	expect(false, "new inputs")
-	writeFiles(t, res, map[string]string{"data/words.txt": "hello"})
+	put("resources/data/words.txt", "hello")
 	expect(true, "new resources")
-	writeFiles(t, res, map[string]string{"data/.DS_Store": "junk"})
+	put("resources/data/.DS_Store", "junk")
 	expect(false, "hidden file in resources")
-	writeFiles(t, res, map[string]string{"data/words.txt": "hello, world"})
+	put("resources/data/words.txt", "hello, world")
 	expect(true, "edited resource")
 	other := "windows-arm64"
 	if runtime.GOOS == "windows" {
 		other = "linux-amd64"
 	}
-	writeFiles(t, res, map[string]string{other + "/bin/server": "x", "darwin-universal/bin/server": "x"})
+	put("resources/"+other+"/bin/server", "x")
+	put("resources/darwin-universal/bin/server", "x")
 	expect(false, "resources of other platforms")
-	writeFiles(t, res, map[string]string{runtime.GOOS + "-" + runtime.GOARCH + "/bin/server": "x"})
+	put("resources/"+runtime.GOOS+"-"+runtime.GOARCH+"/bin/server", "x")
 	expect(true, "resources of this platform")
-	writeFiles(t, res, map[string]string{runtime.GOOS + "/bin/tool": "x"})
+	put("resources/"+runtime.GOOS+"/bin/tool", "x")
 	expect(true, "resources of this system")
 	if runtime.GOOS != "windows" {
 		// Linked entries are followed, as builds follow them.
@@ -205,13 +235,41 @@ func TestWatcher(t *testing.T) {
 			t.Fatal(err)
 		}
 		expect(true, "linked resource")
-		writeFiles(t, sidecar, map[string]string{"server": "12"})
+		put("sidecar/server", "12")
 		expect(true, "edited linked resource")
 	}
 	if err := os.RemoveAll(res); err != nil {
 		t.Fatal(err)
 	}
 	expect(true, "removed resources")
+}
+
+// TestReadDir lists a directory as os.ReadDir does, and lets others
+// delete it meanwhile, which a directory os.Open opened on Windows does
+// not.
+func TestReadDir(t *testing.T) {
+	// Longer than MAX_PATH.
+	dir := filepath.Join(t.TempDir(), strings.Repeat("a", 100), strings.Repeat("b", 100), strings.Repeat("c", 100))
+	writeFiles(t, dir, map[string]string{"b.txt": "", "a/c.txt": "", "C.txt": ""})
+	entries, err := readDir(dir)
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if err != nil || strings.Join(names, " ") != "C.txt a b.txt" {
+		t.Errorf("readDir = %q, %v", names, err)
+	}
+	f, err := openDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := os.RemoveAll(dir); err != nil {
+		t.Errorf("deleting a directory being read: %v", err)
+	}
+	if _, err := readDir(dir); !os.IsNotExist(err) {
+		t.Errorf("readDir of a deleted directory: %v", err)
+	}
 }
 
 // TestListBuildInputs lists the inputs of the mygo command itself.

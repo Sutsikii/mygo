@@ -1,9 +1,10 @@
-//go:build !darwin && !(linux && (amd64 || arm64)) && !(windows && (amd64 || arm64))
+//go:build !darwin && !(linux && (amd64 || arm64)) && !(windows && (amd64 || arm64)) && !js
 
 package e2e
 
 import (
 	"errors"
+	"testing"
 
 	"github.com/egoist/mygo"
 )
@@ -16,6 +17,14 @@ func pressShortcut(string, bool) (bool, bool) { return false, false }
 func endSheet(*mygo.Window) (bool, bool) { return false, false }
 
 func click(*mygo.Window, float64, float64) bool { return false }
+
+func appClick(*mygo.Window, float64, float64) bool { return false }
+
+func heldAppClick(*mygo.Window, float64, float64) bool { return false }
+
+func drag(*mygo.Window, [][2]float64) bool { return false }
+
+func sideButton(*mygo.Window, bool) bool { return false }
 
 func webViewAttached(*mygo.Window) (bool, bool) { return false, false }
 
@@ -47,6 +56,7 @@ func fullScreenHidesToolbar(*mygo.Window) (bool, bool) { return false, false }
 
 // Only macOS windows have traffic lights.
 func trafficLights(*mygo.Window) (float64, float64, bool) { return 0, 0, false }
+func setWindowAppearance(*mygo.Window, bool)              {}
 
 func movePointer(int, int) bool                { return false }
 func pressButton(bool) bool                    { return false }
@@ -65,6 +75,13 @@ func topNonClient(*mygo.Window) (int32, int32, bool) { return 0, 0, false }
 
 func menuBarColors(*mygo.Window) (uint32, uint32, bool) { return 0, 0, false }
 
+func titleButtonColor(*mygo.Window, string) (uint8, uint8, uint8, bool) { return 0, 0, 0, false }
+
+func composition(*mygo.Window) (bool, bool, bool) { return false, false, false }
+func loseComposition(bool) bool                   { return false }
+
+func failWebViews(int) bool { return false }
+
 // A Control-click is a secondary click on macOS only.
 func controlClick(*mygo.Window, float64, float64) bool { return false }
 
@@ -80,13 +97,40 @@ func accessPerform(*mygo.Window, string, string, string) bool { return false }
 
 const roleText, roleButton, roleCheckBox, roleTextField, roleSlider = "text", "button", "check box", "text field", "slider"
 
+// roleListItem is the role of the rows of a List.
+const roleListItem = "list item"
+
 // Typing into native UI is only automated on macOS.
 func clickAndType(*mygo.Window, float64, float64, string) bool { return false }
 func compose(*mygo.Window, string, int, bool) bool             { return false }
 
-// Only Linux draws native UI in a GtkGLArea.
+// Only Linux draws native UI in a GtkGLArea, nor waits to load the GPU's
+// driver.
 func glSurface(*mygo.Window) (string, []byte, int, int, bool) { return "", nil, 0, 0, false }
+func memoryUI(*testing.T) bool                                { return false }
+func surfaceOnScreen(*mygo.Window) ([]byte, bool)             { return nil, false }
+
+// Only Windows reads the screen over native UI.
+func screenColor(*mygo.Window, float64, float64) (uint8, uint8, uint8, bool) { return 0, 0, 0, false }
+
+// Only macOS has key-value observing.
+func observe(*mygo.Window) (func(), bool) { return nil, false }
 
 func rightClick(*mygo.Window, float64, float64) bool { return false }
 func popupMenus() ([][]string, bool)                 { return nil, false }
 func choosePopupItem(string) bool                    { return false }
+
+// Input methods keep the keys typed while they compose from the content
+// themselves here (GTK's filtering, IMM32's VK_PROCESSKEY), which a
+// composition the test makes up does not show.
+func pressKey(*mygo.Window, uint16, string) bool { return false }
+func pressTab(*mygo.Window, bool) bool           { return false }
+
+func dragFiles(*mygo.Window, float64, float64, []string) (bool, bool) { return false, false }
+
+// AppKit's older accessibility API is macOS's.
+func axAttribute(*mygo.Window, string, string) (string, bool, bool, bool) {
+	return "", false, false, false
+}
+
+func pressEscape(*mygo.Window) bool { return false }

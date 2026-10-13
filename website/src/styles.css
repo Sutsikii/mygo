@@ -18,6 +18,8 @@
   --color-bang-4: var(--bang-4);
   --color-bang-5: var(--bang-5);
   --color-code: var(--code);
+  --color-better: var(--better);
+  --color-worse: var(--worse);
   --color-ring: var(--ring);
   --color-input: var(--input);
   --color-border: var(--border);
@@ -57,6 +59,10 @@
   --bang-4: oklch(0.67 0.111 88);
   --bang-5: oklch(0.59 0.078 284);
   --code: oklch(0.985 0 0);
+  /* A benchmark that got faster or leaner, or slower or heavier: text
+     colors, always next to an arrow. */
+  --better: oklch(0.52 0.14 150);
+  --worse: oklch(0.55 0.2 27);
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -87,6 +93,8 @@
   --bang-4: oklch(0.91 0.111 88);
   --bang-5: oklch(0.59 0.078 284);
   --code: oklch(0.165 0 0);
+  --better: oklch(0.78 0.15 150);
+  --worse: oklch(0.72 0.17 25);
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.175 0 0);
@@ -268,6 +276,82 @@
 
   & pre {
     @apply overflow-x-auto px-5 py-4;
+  }
+}
+
+/* A frame of website/docs-demo, a component of native UI in WebAssembly,
+   in a window of macOS: prefers-color-scheme in the frame follows its
+   color-scheme. */
+.ui-preview {
+  @apply my-6 overflow-hidden rounded-[10px];
+  --preview-bar: #fafafa;
+  --preview-bar-border: #ebebeb;
+  --preview-title: #4d4d4d;
+  background: #fff;
+  box-shadow:
+    0 0 0 0.5px rgb(0 0 0 / 0.18),
+    0 4px 12px -4px rgb(0 0 0 / 0.1);
+
+  .dark & {
+    --preview-bar: #2a2a2b;
+    --preview-bar-border: #161617;
+    --preview-title: #b9b9bb;
+    background: #1e1e1e;
+    box-shadow:
+      0 0 0 0.5px rgb(255 255 255 / 0.14),
+      0 0 0 1px rgb(0 0 0 / 0.4),
+      0 4px 12px -4px rgb(0 0 0 / 0.35);
+  }
+}
+
+.ui-preview-titlebar {
+  @apply relative flex h-7 items-center justify-center select-none;
+  background: var(--preview-bar);
+  border-bottom: 1px solid var(--preview-bar-border);
+}
+
+.ui-preview-lights {
+  @apply absolute top-1/2 left-3 flex -translate-y-1/2 gap-2;
+
+  & i {
+    @apply block size-3 rounded-full;
+    box-shadow: inset 0 0 0 0.5px rgb(0 0 0 / 0.12);
+  }
+  & .close {
+    background: #ff5f57;
+  }
+  & .minimize {
+    background: #febc2e;
+  }
+  & .zoom {
+    background: #28c840;
+  }
+}
+
+.ui-preview-title {
+  @apply text-[13px] font-semibold;
+  color: var(--preview-title);
+}
+
+/* Opens the frame's page in a tab of its own, at the right of the title
+   bar. */
+.ui-preview-open {
+  @apply absolute top-1/2 right-2 flex size-6 -translate-y-1/2 items-center justify-center rounded-md opacity-60 transition-opacity;
+  color: var(--preview-title);
+
+  &:hover,
+  &:focus-visible {
+    @apply opacity-100;
+    background: rgb(127 127 127 / 0.15);
+  }
+}
+
+.ui-preview-frame {
+  @apply block w-full border-0;
+  color-scheme: light;
+
+  .dark & {
+    color-scheme: dark;
   }
 }
 

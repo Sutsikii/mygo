@@ -76,7 +76,7 @@ that must start instantly.
 ## Guides
 
 - [Getting started](getting-started.md): install the tools, then create,
-  develop and build an app, with a web frontend or native UI.
+  develop and build an app, with native UI or a web frontend.
 - [Windows](windows.md): creating and arranging windows of both kinds,
   their events, and what windows showing web pages do with them:
   navigation, downloads, permissions, printing.
@@ -87,6 +87,10 @@ that must start instantly.
   keyboard shortcuts and tray icons.
 - [Desktop APIs](native.md): dialogs, notifications, the clipboard, the
   shell, displays, dark mode, power and global shortcuts.
+- [Clipboard and drag data](data-transfer.md): multiple representations,
+  file lists, custom formats, lazy providers, and clipboard persistence.
+- [Audio](audio.md): sound effects, streamed music and sound an app makes
+  itself, mixed in Go, with WAV, Ogg Vorbis and MP3.
 - [Building and distributing](distribution.md): packaged apps for macOS,
   Windows and Linux, signing, installers and disk images.
 - [Auto-updates](updates.md): signed updates from GitHub releases, an S3
@@ -108,9 +112,9 @@ that must start instantly.
 
 ## Native UI
 
-- [The ui package](ui.md): views, layout, text, widgets, input, overlays,
-  accessibility, drawing, images and icons, and testing views without a
-  window.
+[Native UI](ui/README.md) has documentation of its own: guides to views,
+layout, input, navigation and accessibility, and a page for each of its
+components, from buttons to tables.
 
 ## Official plugins
 
@@ -118,8 +122,17 @@ that must start instantly.
   with no CORS, any header, streamed bodies and cancellation.
 - [WebSocket](plugins/websocket.md): a `WebSocket` whose connections Go
   makes, with headers on the handshake.
+- [SQLite](plugins/sqlite.md): local databases with parameterized queries
+  and atomic transactions, without cgo.
 - [Updater](plugins/updater.md): an update window in the manner of
   Sparkle, which checks for updates and offers to install them.
+- [Terminal](plugins/terminal.md): a terminal for native UI, which runs
+  the shell or any program with Ghostty's terminal emulator.
+- [Glass](plugins/glass.md): Liquid Glass for native UI, as macOS draws
+  it, on every platform, with macOS's scroll edges and backdrop blurs.
+- [Game](plugins/game.md): what games need beyond what apps do, opt-in:
+  a game loop in fixed steps with its input, a camera, and gamepads in
+  one standard layout.
 
 ## Reference
 

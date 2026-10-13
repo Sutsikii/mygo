@@ -3,6 +3,7 @@
 package windows
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"syscall"
@@ -173,6 +174,76 @@ func captionButtonPoint(c *captionBar, i int) uintptr {
 	return uintptr(uint16(x)) | uintptr(uint16(y))<<16
 }
 
+// TestCaptionColor puts the pointer over a window control of a hidden
+// title bar, "minimize", "maximize" or "close", as far as the control
+// knows, and returns the color on the screen beside its glyph once Windows
+// has composed it: what the user sees, through UpdateLayeredWindow or
+// DirectComposition. The pointer leaves after.
+func TestCaptionColor(hwnd uintptr, name string) (r, g, b uint8, ok bool) {
+	w := theBackend.windows[hwnd]
+	if w == nil || w.caption == nil {
+		return 0, 0, 0, false
+	}
+	c := w.caption
+	for i, btn := range c.shown {
+		if [...]string{"minimize", "maximize", "close"}[btn] != name {
+			continue
+		}
+		c.setHot(i)
+		defer c.setHot(-1)
+		dwmapi.NewProc("DwmFlush").Call() // until the next frame shows what was drawn
+		var rc rect
+		procGetWindowRect.Call(c.buttons, uintptr(unsafe.Pointer(&rc)))
+		bw := (rc.Right - rc.Left) / int32(len(c.shown))
+		x, y := rc.Left+int32(i)*bw+3, rc.Top+(rc.Bottom-rc.Top)/2
+		screen, _, _ := procGetDC.Call(0)
+		defer procReleaseDC.Call(0, screen)
+		px, _, _ := gdi32.NewProc("GetPixel").Call(screen, uintptr(x), uintptr(y))
+		if px == 0xFFFFFFFF { // CLR_INVALID
+			return 0, 0, 0, false
+		}
+		return uint8(px), uint8(px >> 8), uint8(px >> 16), true
+	}
+	return 0, 0, 0, false
+}
+
+// TestComposed reports whether a window has no redirection bitmap, for the
+// material behind its page, and whether the controls of its hidden title
+// bar show through the DirectComposition device in use.
+func TestComposed(hwnd uintptr) (noRedirect, composed bool) {
+	w := theBackend.windows[hwnd]
+	if w == nil {
+		return false, false
+	}
+	c := w.caption
+	return w.noRedirect, c != nil && c.comp != nil && c.comp.dev != nil && c.comp.dev == theBackend.comp
+}
+
+// TestLoseComposition takes the DirectComposition device away, as a draw
+// that finds it invalid does, or, with removed, signals that its GPU device
+// was removed. It reports false without a device, or, with removed,
+// without the event (Windows 10 before 1607).
+func TestLoseComposition(removed bool) bool {
+	c := theBackend.comp
+	switch {
+	case c == nil, removed && c.removed == 0:
+		return false
+	case removed:
+		procSetEvent.Call(c.removed)
+	default:
+		theBackend.loseComposition(errors.New("taken away by a test"))
+	}
+	return true
+}
+
+// testFailWebViews is how many creations of webviews still fail
+// (TestFailWebViews).
+var testFailWebViews int
+
+// TestFailWebViews makes the next n creations of webviews fail, as WebView2
+// reports a failure, when it would have created them; 0 lets them be.
+func TestFailWebViews(n int) { testFailWebViews = n }
+
 // TestTopNonClient returns how many pixels at the top of a window are not
 // its client area, and how many a hidden title bar keeps there on this
 // version of Windows: one on Windows 11, none on Windows 10.
@@ -201,6 +272,66 @@ func TestClickSurface(hwnd uintptr, x, y float64) bool {
 	procSendMessageW.Call(w.surface.hwnd, wmMouseMove, 0, lp)
 	procSendMessageW.Call(w.surface.hwnd, wmLButtonDown, mkLButton, lp)
 	procSendMessageW.Call(w.surface.hwnd, wmLButtonUp, 0, lp)
+	return true
+}
+
+// TestInputClick clicks a point of a window showing native UI with the
+// system's input, as a mouse does: the window it lands on activates as
+// for the user.
+func TestInputClick(hwnd uintptr, x, y float64) bool {
+	w := theBackend.windows[hwnd]
+	if w == nil || w.surface == nil {
+		return false
+	}
+	scale := float64(w.surface.dpi()) / 96
+	pt := point{int32(x * scale), int32(y * scale)}
+	procClientToScreen.Call(w.surface.hwnd, uintptr(unsafe.Pointer(&pt)))
+	user32.NewProc("SetCursorPos").Call(uintptr(pt.X), uintptr(pt.Y))
+	mouse := user32.NewProc("mouse_event")
+	const leftDown, leftUp = 0x0002, 0x0004
+	mouse.Call(leftDown, 0, 0, 0, 0)
+	mouse.Call(leftUp, 0, 0, 0, 0)
+	return true
+}
+
+// TestSideButton clicks a mouse's back or forward button (XBUTTON1 and
+// XBUTTON2) in a window showing native UI, with the messages a mouse
+// sends.
+func TestSideButton(hwnd uintptr, back bool) bool {
+	w := theBackend.windows[hwnd]
+	if w == nil || w.surface == nil {
+		return false
+	}
+	button, held := uintptr(2), uintptr(0x40) // XBUTTON2, MK_XBUTTON2
+	if back {
+		button, held = 1, 0x20 // XBUTTON1, MK_XBUTTON1
+	}
+	scale := float64(w.surface.dpi()) / 96
+	lp := uintptr(uint16(int16(20*scale)))<<16 | uintptr(uint16(int16(20*scale)))
+	procSendMessageW.Call(w.surface.hwnd, wmXButtonDown, button<<16|held, lp)
+	procSendMessageW.Call(w.surface.hwnd, wmXButtonUp, button<<16, lp)
+	return true
+}
+
+// TestDragSurface presses the primary button at the first of points, in
+// DIPs, in a window showing native UI, moves the pointer through the
+// others, and releases it at the last, with the messages a mouse sends.
+func TestDragSurface(hwnd uintptr, points [][2]float64) bool {
+	w := theBackend.windows[hwnd]
+	if w == nil || w.surface == nil || len(points) < 2 {
+		return false
+	}
+	scale := float64(w.surface.dpi()) / 96
+	lp := func(p [2]float64) uintptr {
+		return uintptr(uint16(int16(p[1]*scale)))<<16 | uintptr(uint16(int16(p[0]*scale)))
+	}
+	const mkLButton = 1
+	procSendMessageW.Call(w.surface.hwnd, wmMouseMove, 0, lp(points[0]))
+	procSendMessageW.Call(w.surface.hwnd, wmLButtonDown, mkLButton, lp(points[0]))
+	for _, p := range points[1:] {
+		procSendMessageW.Call(w.surface.hwnd, wmMouseMove, mkLButton, lp(p))
+	}
+	procSendMessageW.Call(w.surface.hwnd, wmLButtonUp, 0, lp(points[len(points)-1]))
 	return true
 }
 

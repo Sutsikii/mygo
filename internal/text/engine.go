@@ -12,6 +12,8 @@ import (
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
+
+	"github.com/egoist/mygo/internal/scene"
 )
 
 // An engine is the system's own text stack: DirectWrite on Windows, Core
@@ -32,11 +34,77 @@ type engine interface {
 	shape(text []rune, style Style, spans []Span, width float32, rtl, wholeWords bool) []shapedLine
 	// glyph rasterizes glyph id of f at scale pixels per DIP, its origin
 	// dx pixels (0 ≤ dx < 1) right of the left edge of a pixel, for text
-	// of a shade when f is shaded.
-	glyph(f *Font, id uint32, scale, dx float32, shade Shade) bitmap
+	// of a shade when f is shaded or the shade is Thick, with subpixel
+	// antialiasing if subpixel.
+	glyph(f *Font, id uint32, scale, dx float32, shade Shade, subpixel bool) bitmap
+	// positions returns how many horizontal positions within a pixel
+	// glyphs of f at scale pixels per DIP are drawn at, with subpixel
+	// antialiasing if subpixel, and whether a pen goes to the nearest
+	// (round) or to the one left of it.
+	positions(f *Font, scale float32, subpixel bool) (n int, round bool)
+	// baseline returns the whole pixel a baseline y device pixels from the
+	// top is drawn at.
+	baseline(y float32) float32
+	// decorate returns the strokes of a decoration (see System.Decorate).
+	decorate(r decoRange) []Stroke
+	// join reports whether the engine's text stack adds the coverage of
+	// the glyphs of a run whose edges share pixels before blending it.
+	join() bool
+	// textParams returns how renderers correct the coverage of glyphs,
+	// and whether glyphs take subpixel antialiasing, as the system's
+	// settings say.
+	textParams() (p scene.TextParams, subpixel bool)
 	// register adds the fonts of a font file under family, or under their
 	// own family names when family is "".
 	register(data []byte, family string) error
+	// resetScratch frees the room shape took from the engine's scratch,
+	// as a layout starts.
+	resetScratch()
+}
+
+// shapeScratch is room engines take the glyphs, runs and lines shape returns
+// from, which live until the System lays out the next text: a layout
+// copies them into its own lines. Engines embed it.
+type shapeScratch struct {
+	glyphs []Glyph
+	runs   []shapedRun
+	lines  []shapedLine
+}
+
+// maxScratch is how many glyphs shapeScratch keeps room for between layouts:
+// a long text's room goes with it.
+const maxScratch = 4096
+
+func (s *shapeScratch) resetScratch() {
+	if cap(s.glyphs) > maxScratch {
+		s.glyphs, s.runs, s.lines = nil, nil, nil
+	}
+	s.glyphs, s.runs, s.lines = s.glyphs[:0], s.runs[:0], s.lines[:0]
+}
+
+// glyphRoom returns room for n glyphs until the next layout.
+func (s *shapeScratch) glyphRoom(n int) []Glyph {
+	if cap(s.glyphs)-len(s.glyphs) < n {
+		// Slices taken before keep the old room.
+		s.glyphs = make([]Glyph, 0, max(2*cap(s.glyphs), n, 256))
+	}
+	k := len(s.glyphs)
+	s.glyphs = s.glyphs[:k+n]
+	return s.glyphs[k : k+n : k+n]
+}
+
+// addRun adds a run after those taken since mark, the length of runs
+// then, and returns them.
+func (s *shapeScratch) addRun(mark int, r shapedRun) []shapedRun {
+	s.runs = append(s.runs, r)
+	return s.runs[mark:len(s.runs):len(s.runs)]
+}
+
+// addLine adds a line after those taken since mark, the length of lines
+// then, and returns them.
+func (s *shapeScratch) addLine(mark int, l shapedLine) []shapedLine {
+	s.lines = append(s.lines, l)
+	return s.lines[mark:len(s.lines):len(s.lines)]
 }
 
 // shapedLine is a line of a paragraph as an engine laid it out.
@@ -64,9 +132,10 @@ type bitmap struct {
 	// glyph's origin, y down.
 	left, top, w, h int
 	// pix holds a byte of coverage per pixel, or for color glyphs four
-	// bytes of premultiplied RGBA.
-	pix   []byte
-	color bool
+	// bytes of premultiplied RGBA, or for subpixel ones the coverage of
+	// the red, green and blue subpixels and a fourth byte.
+	pix             []byte
+	color, subpixel bool
 }
 
 // Font is a font of the system, or of the app, at a size. Layouts and
@@ -80,8 +149,14 @@ type Font struct {
 	Ascent, Descent, LineGap float32
 
 	native uintptr // the engine's font
-	// shaded fonts' glyphs differ by the shade of the text.
-	shaded bool
+	// shaded fonts' glyphs differ by the shade of the text; thin ones are
+	// too thin for antialiasing (GlyphImage.Thin). The engine draws the
+	// glyphs of fonts that thicken thicker for Thick.
+	shaded, thin, thickens bool
+	// The tops of the font's underline and strikethrough, in DIPs above
+	// the baseline, and their thickness, for engines that decorate with
+	// them (DirectWrite and Pango).
+	underlineTop, underlineThick, strikeTop, strikeThick float32
 }
 
 // generic names the families "system-ui", "sans-serif", "serif" and
@@ -110,6 +185,9 @@ type feature struct {
 // features parses Style.Features, leaving out what is not a tag of four
 // printable characters with an optional =value.
 func features(list string) []feature {
+	if list == "" {
+		return nil
+	}
 	var out []feature
 	for _, item := range strings.Split(list, ",") {
 		tag, value, set := strings.Cut(strings.TrimSpace(item), "=")
@@ -145,8 +223,12 @@ func familyList(family string) []string {
 // utf16Text encodes runes as UTF-16, with the rune index of every code
 // unit and of the end.
 func utf16Text(runes []rune) (text []uint16, index []int) {
-	text = make([]uint16, 0, len(runes)+1)
-	index = make([]int, 0, len(runes)+1)
+	return appendUTF16(make([]uint16, 0, len(runes)+1), make([]int, 0, len(runes)+1), runes)
+}
+
+// appendUTF16 appends the UTF-16 encoding of runes to text, and the rune
+// index of every code unit and of the end to index.
+func appendUTF16(text []uint16, index []int, runes []rune) ([]uint16, []int) {
 	for i, r := range runes {
 		if r >= 0x10000 && r <= utf8.MaxRune {
 			a, b := utf16.EncodeRune(r)

@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/egoist/mygo/internal/platform"
@@ -63,44 +64,142 @@ func (w *window) hasScheme(s string) bool {
 	return false
 }
 
+// pendingCall is a call waiting for the webview. fail, unless nil, runs
+// instead when the webview never comes, so that the call's callback runs.
+type pendingCall struct {
+	run  func()
+	fail func(error)
+}
+
+var errNoWebView = errors.New("mygo: the window shows native UI, not a web page")
+
 // withWebView runs fn once the webview exists.
-func (w *window) withWebView(fn func()) {
-	if w.closed || w.surface != nil {
-		return
-	}
-	if w.ready {
+func (w *window) withWebView(fn func()) { w.withWebViewOr(fn, nil) }
+
+// withWebViewOr runs fn once the webview exists, or fail, unless nil, with
+// the reason it never will: the window closed, or WebView2 could not
+// create the webview.
+func (w *window) withWebViewOr(fn func(), fail func(error)) {
+	var err error
+	switch {
+	case w.closed:
+		err = errDestroyed
+	case w.surface != nil:
+		err = errNoWebView
+	case w.webViewErr != nil:
+		err = w.webViewErr
+	case w.ready:
 		fn()
 		return
+	default:
+		w.pending = append(w.pending, pendingCall{fn, fail})
+		return
 	}
-	w.pending = append(w.pending, fn)
+	if fail != nil {
+		fail(err)
+	}
 }
+
+// failPending fails the calls waiting for the webview.
+func (w *window) failPending(err error) {
+	pending := w.pending
+	w.pending = nil
+	for _, c := range pending {
+		if c.fail != nil {
+			c.fail(err)
+		}
+	}
+}
+
+// webViewFailed records why the window has no webview, which later calls
+// get, and fails those waiting for it.
+func (w *window) webViewFailed(err error) {
+	if w.webViewErr != nil {
+		return
+	}
+	log.Print(err)
+	w.webViewErr = err
+	w.failPending(err)
+}
+
+// A window asks WebView2 for its webview up to webViewAttempts times, a
+// second, then two, apart: under load, creations fail with ERROR_BUSY or
+// CO_E_SERVER_EXEC_FAILURE, and Microsoft advises trying again unless one
+// failed with ERROR_INVALID_STATE (the environment's options differ from
+// those of the browser process running for its user data).
+const (
+	webViewAttempts   = 3
+	errorInvalidState = 0x8007139F // HRESULT_FROM_WIN32(ERROR_INVALID_STATE)
+	timerWebView      = 2          // the window's timer that asks again
+)
 
 func (w *window) createWebView() {
 	if w.closed {
 		return
 	}
 	if w.b.envErr != nil {
-		log.Print(w.b.envErr)
+		w.webViewFailed(w.b.envErr)
 		return
 	}
+	fail := testFailWebViews > 0
+	if fail {
+		testFailWebViews--
+	}
 	hr := withHandler(func(hr, controller uintptr) {
+		// A web view in a window of native UI gets a composition
+		// controller, whose controller closes it.
+		closeController := func() {
+			if c := queryInterface(controller, &iidICoreWebView2Controller); c != 0 {
+				comCall(c, ctlClose)
+				release(c)
+			}
+		}
+		if fail && controller != 0 { // TestFailWebViews
+			closeController()
+			hr, controller = eFail, 0
+		}
 		// Closing the window aborts the creation (E_ABORT).
-		if w.closed || w.destroying {
+		if w.closed || w.destroying || w.host != nil && w.host.closed {
 			if controller != 0 {
-				comCall(controller, ctlClose)
+				closeController()
 			}
 			return
 		}
 		if failed(hr) || controller == 0 {
-			log.Print(hresultError("creating the WebView2 controller", hr))
+			w.creationFailed(hr)
 			return
 		}
 		addRef(controller)
+		if w.host != nil {
+			controller = w.setUpEmbedded(controller)
+		}
 		w.setUp(controller)
-	}, func(h uintptr) uintptr { return comCall(w.b.env, envCreateController, w.hwnd, h) })
+	}, func(h uintptr) uintptr {
+		if w.host != nil {
+			return w.createEmbedded(h)
+		}
+		return comCall(w.b.env, envCreateController, w.hwnd, h)
+	})
 	if failed(hr) {
-		log.Print(hresultError("creating the WebView2 controller", hr))
+		w.creationFailed(hr)
 	}
+}
+
+// creationFailed has the window ask for its webview again later, or, if it
+// may not, fails the calls waiting for it.
+func (w *window) creationFailed(hr uintptr) {
+	err := hresultError("creating the WebView2 controller", hr)
+	w.webViewFails++
+	if hr == errorInvalidState || w.webViewFails >= webViewAttempts {
+		w.webViewFailed(err)
+		return
+	}
+	log.Printf("%v; trying again", err)
+	hwnd := w.hwnd
+	if w.host != nil && w.host.surface != nil {
+		hwnd = w.host.surface.hwnd // which asks again for its web views
+	}
+	procSetTimer.Call(hwnd, timerWebView, uintptr(backoff(w.webViewFails-1)/time.Millisecond), 0)
 }
 
 func (w *window) setUp(controller uintptr) {
@@ -190,8 +289,15 @@ func (w *window) setUp(controller uintptr) {
 		return comCall(controller, ctlAddAcceleratorKeyPressed, h, tok)
 	})
 
-	comCall(controller, ctlPutIsVisible, 1)
-	w.resizeWebView()
+	if w.host != nil {
+		w.placeEmbedded()
+		if l := w.host.surface.layer; l != nil {
+			l.commit()
+		}
+	} else {
+		comCall(controller, ctlPutIsVisible, 1)
+		w.resizeWebView()
+	}
 	if w.caption != nil {
 		w.caption.layout() // above the webview's window
 	}
@@ -206,11 +312,14 @@ func (w *window) setUp(controller uintptr) {
 	w.ready = true
 	pending := w.pending
 	w.pending = nil
-	for _, fn := range pending {
+	for i, c := range pending {
 		if w.closed {
+			// A call closed the window: the others never run.
+			w.pending = pending[i:]
+			w.failPending(errDestroyed)
 			return
 		}
-		fn()
+		c.run()
 	}
 }
 
@@ -239,17 +348,45 @@ func (w *window) navigationStarting(_, args uintptr) {
 	uri := w.appURL(takeWstr(p))
 	var user int32
 	comCall(args, navStartingGetIsUserInitiated, uintptr(unsafe.Pointer(&user)))
-	nav := platform.Navigation{URL: uri, IsMainFrame: true, UserInitiated: user != 0}
+	kind := navigationKind(args)
+	nav := platform.Navigation{URL: uri, IsMainFrame: true, UserInitiated: user != 0, Unasked: kind == navReload || kind == navBackOrForward, Reload: kind == navReload}
 	if w.programmatic {
 		w.programmatic = false
-		nav.IsReload = true
+		nav.Unasked = true
 	}
 	if !w.h.WillNavigate(nav) {
 		comCall(args, navStartingPutCancel, 1)
 		return
 	}
+	// LoadHTML serves its document to its navigation, which may request
+	// it more than once, and not to later ones.
+	if w.htmlNext {
+		w.htmlNext = false
+	} else {
+		clear(w.htmlFor)
+	}
 	w.loading = true
 	w.h.NavigationStarted(uri)
+}
+
+// COREWEBVIEW2_NAVIGATION_KIND
+const (
+	navReload = iota
+	navBackOrForward
+	navNewDocument
+)
+
+// navigationKind returns the COREWEBVIEW2_NAVIGATION_KIND of a navigation,
+// or -1 on runtimes older than it.
+func navigationKind(args uintptr) int32 {
+	args3 := queryInterface(args, &iidICoreWebView2NavigationStartingEventArgs3)
+	if args3 == 0 {
+		return -1
+	}
+	defer release(args3)
+	kind := int32(-1)
+	comCall(args3, navStarting3GetNavigationKind, uintptr(unsafe.Pointer(&kind)))
+	return kind
 }
 
 func (w *window) navigationCompleted(_, args uintptr) {
@@ -412,6 +549,7 @@ func (w *window) newWindowRequested(_, args uintptr) {
 // Accelerator keys reach the webview, not the window: run the menu items
 // they belong to from here.
 func (w *window) acceleratorKeyPressed(_, args uintptr) {
+	w = w.top() // a web view's keys are its window's
 	var kind int32
 	comCall(args, accelGetKeyEventKind, uintptr(unsafe.Pointer(&kind)))
 	if kind != 0 && kind != 2 { // KEY_DOWN, SYSTEM_KEY_DOWN
@@ -445,6 +583,7 @@ func (w *window) LoadHTML(html, baseURL string) {
 		// and custom schemes work as in the other backends.
 		target := w.webURL(baseURL)
 		w.htmlFor[target] = html
+		w.htmlNext = true
 		if w.appURL(target) == target { // not covered by the filters of the schemes
 			w.addFilter(target)
 		}
@@ -505,16 +644,12 @@ func (w *window) Eval(js string) {
 // CallAsyncFunction evaluates through the DevTools protocol, which awaits
 // promises, reports syntax errors and ignores the page's CSP.
 func (w *window) CallAsyncFunction(body string, cb func(string, error)) {
-	if w.closed {
-		cb("", errDestroyed)
-		return
-	}
 	params, _ := json.Marshal(map[string]any{
 		"expression":    "(async () => {\n" + body + "\n})()",
 		"awaitPromise":  true,
 		"returnByValue": true,
 	})
-	w.withWebView(func() {
+	w.withWebViewOr(func() {
 		w.devtools("Runtime.evaluate", string(params), func(result string, err error) {
 			if err != nil {
 				cb("", err)
@@ -547,7 +682,7 @@ func (w *window) CallAsyncFunction(body string, cb func(string, error)) {
 			_ = json.Unmarshal(out.Result.Value, &s)
 			cb(s, nil)
 		})
-	})
+	}, func(err error) { cb("", err) })
 }
 
 // devtools calls a DevTools protocol method; done may be nil.
@@ -627,11 +762,7 @@ func (w *window) CloseDevTools()         {}
 func (w *window) IsDevToolsOpened() bool { return w.devTools }
 
 func (w *window) CapturePage(cb func([]byte, error)) {
-	if w.closed {
-		cb(nil, errDestroyed)
-		return
-	}
-	w.withWebView(func() {
+	w.withWebViewOr(func() {
 		var stream uintptr
 		if r, _, _ := procCreateStreamOnHGlobal.Call(0, 1, uintptr(unsafe.Pointer(&stream))); failed(r) {
 			cb(nil, hresultError("CreateStreamOnHGlobal", r))
@@ -659,7 +790,7 @@ func (w *window) CapturePage(cb func([]byte, error)) {
 			release(stream)
 			cb(nil, hresultError("CapturePreview", hr))
 		}
-	})
+	}, func(err error) { cb(nil, err) })
 }
 
 // hglobalBytes copies the memory behind a stream made by
@@ -693,21 +824,23 @@ func (w *window) PrintToPDF(o platform.PDFOptions, cb func([]byte, error)) {
 		"marginLeft":        o.MarginLeft,
 		"preferCSSPageSize": false,
 	})
-	w.devtools("Page.printToPDF", string(params), func(res string, err error) {
-		if err != nil {
-			cb(nil, fmt.Errorf("mygo: printing to PDF: %w", err))
-			return
-		}
-		var r struct {
-			Data string `json:"data"`
-		}
-		if err := json.Unmarshal([]byte(res), &r); err != nil {
-			cb(nil, err)
-			return
-		}
-		pdf, err := base64.StdEncoding.DecodeString(r.Data)
-		cb(pdf, err)
-	})
+	w.withWebViewOr(func() {
+		w.devtools("Page.printToPDF", string(params), func(res string, err error) {
+			if err != nil {
+				cb(nil, fmt.Errorf("mygo: printing to PDF: %w", err))
+				return
+			}
+			var r struct {
+				Data string `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(res), &r); err != nil {
+				cb(nil, err)
+				return
+			}
+			pdf, err := base64.StdEncoding.DecodeString(r.Data)
+			cb(pdf, err)
+		})
+	}, func(err error) { cb(nil, err) })
 }
 
 // Custom scheme requests.
@@ -721,9 +854,11 @@ func (w *window) resourceRequested(_, args uintptr) {
 	var p uintptr
 	comCall(req, reqGetURI, uintptr(unsafe.Pointer(&p)))
 	uri := takeWstr(p)
+	var resource int32
+	comCall(args, resReqGetResourceContext, uintptr(unsafe.Pointer(&resource)))
+	const document = 1 // COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT
 
-	if html, ok := w.htmlFor[uri]; ok {
-		delete(w.htmlFor, uri)
+	if html, ok := w.htmlFor[uri]; ok && resource == document {
 		w.respond(args, 0, http.StatusOK, http.Header{"Content-Type": {"text/html; charset=utf-8"}}, []byte(html))
 		return
 	}
@@ -745,9 +880,6 @@ func (w *window) resourceRequested(_, args uintptr) {
 	addRef(args)
 	ctx, cancel := context.WithCancel(context.Background())
 	sreq.Context = ctx
-	var resource int32
-	comCall(args, resReqGetResourceContext, uintptr(unsafe.Pointer(&resource)))
-	const document = 1 // COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT
 	sreq.Responder = &schemeResponse{w: w, args: args, deferral: deferral, cancel: cancel, url: target, document: resource == document}
 	w.h.SchemeRequest(sreq)
 }
@@ -817,7 +949,7 @@ type schemeResponse struct {
 	done     bool
 }
 
-func (r *schemeResponse) Respond(status int, header http.Header) {
+func (r *schemeResponse) Respond(status int, header map[string][]string) {
 	r.status, r.header = status, header
 }
 

@@ -3,11 +3,14 @@
 // other's internals.
 package surface
 
-import "github.com/egoist/mygo/internal/platform"
+import (
+	"github.com/egoist/mygo/internal/platform"
+	"github.com/egoist/mygo/transfer"
+)
 
 // Conn is a window's side of the connection. Package mygo fills it before
 // calling Content.AttachContent; the content sets the hooks it handles.
-// Everything runs on the main thread, except Invalidate.
+// Everything runs on the main thread, except Invalidate and Post.
 type Conn struct {
 	Surface platform.Surface
 	// Window is the *mygo.Window.
@@ -18,22 +21,52 @@ type Conn struct {
 	// TitleBarDoubleClicked does what a double click on a title bar does.
 	StartDrag             func()
 	TitleBarDoubleClicked func()
-	// IsDark reports the system's dark appearance.
-	IsDark func() bool
+	// Escape is called with an Escape that no element or shortcut of the
+	// content handled, which closes a flyout.
+	Escape func()
+	// StartDataDrag connects a UI source to the core's process-local
+	// registry. local never leaves the process.
+	StartDataDrag  func(transfer.Data, any, transfer.DragOptions, float64, float64) error
+	CancelDataDrag func()
+	// IsDark reports the system's dark appearance, and Preferences the
+	// settings of the desktop that controls follow, which ThemeChanged
+	// tells changes of as well.
+	IsDark      func() bool
+	Preferences func() platform.Preferences
 	// UIFont returns the family of the desktop's interface font where the
 	// system's text stack does not know it (Linux), else "".
 	UIFont func() string
+	// FontRendering returns how the desktop's settings say to rasterize
+	// text where the system's text stack does not know them (Linux).
+	FontRendering func() platform.FontRendering
 	// TitleBar returns the room the window controls take in a window with
 	// a hidden title bar, zero in other windows.
 	TitleBar func() platform.TitleBar
-	// OpenURL opens a link in the default browser.
-	OpenURL func(url string)
+	// OpenURL opens a link in the default browser, and gives done, unless
+	// nil, what came of it on the main thread.
+	OpenURL func(url string, done func(error))
+	// DevTools tells that the window's developer tools are on
+	// (PageOptions.DevTools): the content then opens its inspector.
+	DevTools bool
 	// Invalidate asks for a frame; it is safe from any goroutine.
 	Invalidate func()
+	// Changed asks for a frame built anew after the app changed the state
+	// the content shows (Window.Update, Window.Invalidate); the content
+	// sets it, else the window asks the surface for a frame.
+	Changed func()
+	// Post runs fn on the main thread soon, unless the window has closed;
+	// it is safe from any goroutine.
+	Post func(fn func())
+	// Ready tells that the content presented its first frame: the window
+	// is ready to show (Window.OnReadyToShow).
+	Ready func()
 	// PopupMenu shows m as a context menu at (x, y) in the surface, in
 	// DIPs, once the event being handled returns. chosen receives the ID of
 	// the item chosen, if one is.
 	PopupMenu func(m *platform.Menu, x, y float64, chosen func(id int))
+	// PlaceWebViews shows the window's web views where the content's last
+	// frame shows them (Surface.PlaceWebViews).
+	PlaceWebViews func(views []platform.WebViewPlacement)
 
 	// Event receives the surface's events, and Focus and Blur of the
 	// window. It reports whether the content takes dragged files, as
@@ -45,6 +78,9 @@ type Conn struct {
 	TitleBarChanged func()
 	// Capture renders the content as it is now into premultiplied RGBA.
 	Capture func() (width, height int, rgba []byte)
+	// ToggleDevTools opens or closes the content's inspector, for the
+	// Toggle Developer Tools menu item, when DevTools is set.
+	ToggleDevTools func()
 	// Detach is called once the window is closed.
 	Detach func()
 }
@@ -52,4 +88,12 @@ type Conn struct {
 // Content is implemented by package ui.
 type Content interface {
 	AttachContent(conn *Conn)
+}
+
+// WebView is a web view a window made for its content to show
+// (*mygo.WebView, of Window.NewWebView), which package ui places.
+type WebView interface {
+	// SurfaceWebView returns the web view's native side when it is of the
+	// window of conn and not destroyed, else nil. Main thread only.
+	SurfaceWebView(conn *Conn) platform.WebView
 }

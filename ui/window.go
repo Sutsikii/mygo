@@ -1,9 +1,9 @@
 package ui
 
 import (
-	"image"
 	"log"
 	"os"
+	"slices"
 	"time"
 
 	"github.com/egoist/mygo/internal/platform"
@@ -11,12 +11,13 @@ import (
 	"github.com/egoist/mygo/internal/scene"
 	"github.com/egoist/mygo/internal/surface"
 	"github.com/egoist/mygo/internal/text"
+	"github.com/egoist/mygo/transfer"
 )
 
 // Content is a user interface for a window, the value of
 // mygo.WindowOptions.Content. Create it with View.
 type Content struct {
-	view func(*Context)
+	view func(*context)
 }
 
 // View returns the content of a window whose user interface view builds,
@@ -28,7 +29,7 @@ type Content struct {
 // input, after Context.Invalidate or Window.Invalidate, and while
 // something animates. A Content can serve several windows, each with its
 // own state.
-func View(view func(c *Context)) *Content { return &Content{view: view} }
+func coreView(view func(c *context)) *Content { return &Content{view: view} }
 
 // RegisterFont adds a TrueType or OpenType font, or collection, that text
 // can use with Font(family). An empty family keeps the font's own name.
@@ -48,8 +49,15 @@ func (v *Content) AttachContent(conn *surface.Conn) {
 		rt.themeChanged()
 	}
 	conn.TitleBarChanged = rt.requestFrame
+	conn.Changed = rt.changed
 	conn.Capture = h.capture
 	conn.Detach = h.detach
+	rt.insp.enabled = conn.DevTools
+	conn.ToggleDevTools = func() {
+		if rt.insp.enabled {
+			rt.toggleInspector()
+		}
+	}
 	h.uiFont()
 	// Load the fonts while the window shows up.
 	go text.Shared().Preload()
@@ -75,12 +83,31 @@ type windowHost struct {
 	backoff  time.Duration
 	soft     raster.Renderer
 	last     *scene.Scene
-	// lastFrame is when the last frame was presented, and gpuSinceCPU
-	// when the first since the CPU drew one, if the GPU drew it.
-	lastFrame, gpuSinceCPU time.Time
+	// lastFrame is when the last frame was presented.
+	lastFrame time.Time
 	// framing tells that the surface asked for the frame being drawn.
 	framing bool
+	// path is how the last frame was drawn, for MYGO_FRAME_STATS.
+	path string
+	// wide tells that the GPU renderer draws the colors of scenes outside
+	// the sRGB gamut (see wideHold), until wideUntil.
+	wide      bool
+	wideUntil time.Time
+	// idleTimer runs idle once frames stop, at idleAt when idleArmed.
+	idleTimer *time.Timer
+	idleAt    time.Time
+	idleArmed bool
+	detached  bool
+	// shown tells that a frame was presented, which makes the window
+	// ready to show.
+	shown bool
+	// placed is where the surface shows the window's web views, views
+	// the web views.
+	placed []platform.WebViewPlacement
+	views  []NativeWebView
 }
+
+func (h *windowHost) framePath() string { return h.path }
 
 // newGPU makes the GPU renderer of a surface; tests replace it.
 var newGPU = newGPURenderer
@@ -88,6 +115,23 @@ var newGPU = newGPURenderer
 // event handles an event of the surface, noting when it asks for a frame:
 // only then may renderers draw (OpenGL's context is current only then).
 func (h *windowHost) event(ev platform.SurfaceEvent) bool {
+	if ev.Kind == platform.SurfaceRenew {
+		// The next frame makes the renderer again, for the surface's new
+		// native objects.
+		if h.gpu != nil {
+			h.gpu.Release()
+			h.gpu = nil
+		}
+		h.gpuTried, h.retryAt = false, time.Time{}
+		h.conn.Surface.RequestFrame()
+		return false
+	}
+	if ev.Kind == platform.WebViewTabOut {
+		if i := slices.IndexFunc(h.placed, func(p platform.WebViewPlacement) bool { return p.WebView == ev.WebView }); i >= 0 {
+			h.rt.webViewTabOut(h.views[i], ev.Mods&platform.ModShift != 0)
+		}
+		return false
+	}
 	if ev.Kind == platform.SurfaceFrame {
 		h.framing = true
 		defer func() { h.framing = false }()
@@ -101,23 +145,36 @@ type gpuRenderer interface {
 	Release()
 }
 
-// pixelPresenter is a GPU renderer that also shows frames drawn in memory,
-// without the GPU, copying where they changed (Metal's).
-type pixelPresenter interface {
-	PresentPixels(pix []byte, stride, width, height int, scale float64, damage []image.Rectangle) error
+// wideRenderer is a GPU renderer that can draw the colors of scenes outside
+// the sRGB gamut (Metal's).
+type wideRenderer interface {
+	// SetWide has the frames drawn from now on show those colors, into
+	// drawables of a wide gamut, or their nearest sRGB ones, and reports
+	// whether they do.
+	SetWide(on bool) bool
 }
 
-// Frames that change little draw on the CPU, which the renderer copies
-// into its drawables: a clock ticking, typing, the pointer over a button.
-// The CPU draws them in less time than the GPU takes to start, and spares
-// the memory Metal's driver holds for a couple of seconds after each frame
-// it draws. Frames changing more than a sixteenth of the window while
-// frames follow each other, as when scrolling or animating most of it,
-// draw on the GPU, as do frames redrawing more than cpuMaxPixels.
-const (
-	burstGap     = 50 * time.Millisecond // frames closer follow each other
-	cpuMaxPixels = 8 << 20
-)
+// A window whose screen shows more than sRGB, as a Mac's Display P3
+// screen, draws the colors of ui.Oklch outside the sRGB gamut once a frame
+// has some, on the GPU, whose drawables then hold float16 components, and
+// goes on for wideHold after the last frame with some: a blinking caret or
+// a color in transition does not switch the drawables back and forth. The
+// CPU draws sRGB colors: frames meanwhile are the GPU's, and those after
+// it may draw on the CPU again. A window on an sRGB screen draws the
+// nearest sRGB colors, as it would show anyway, with the CPU's frames.
+const wideHold = 2 * time.Second
+
+// frameIdle is how long after the last frame the host frees the frame
+// drawn in memory, as large as the window, and the surface gives back what
+// its frames took (platform.IdleSurface). The next frame draws whole.
+const frameIdle = 2 * time.Second
+
+func (h *windowHost) refreshRate() float32 { return float32(h.conn.Surface.RefreshRate()) }
+
+func (h *windowHost) occluded() bool {
+	s, ok := h.conn.Surface.(platform.OccludableSurface)
+	return ok && s.Occluded()
+}
 
 func (h *windowHost) size() (float32, float32, float32) {
 	w, ht, s := h.conn.Surface.Size()
@@ -128,7 +185,7 @@ func (h *windowHost) size() (float32, float32, float32) {
 }
 
 func (h *windowHost) present(s *scene.Scene) {
-	h.last = s
+	h.last, h.path = s, ""
 	if s.Width <= 0 || s.Height <= 0 {
 		return
 	}
@@ -149,53 +206,99 @@ func (h *windowHost) present(s *scene.Scene) {
 		h.makeGPU()
 	}
 	now := time.Now()
-	burst := now.Sub(h.lastFrame) < burstGap
 	h.lastFrame = now
-	if h.drawOnCPU(s, burst) {
-		h.gpuSinceCPU = time.Time{}
-		return
-	}
+	h.armIdle(frameIdle)
+	h.useWide(s, now)
+	defer h.ready()
 	if h.render(s) {
-		h.dropCPUFrame(now)
+		h.path = "drawn on the GPU"
+		if h.degraded {
+			h.path = "drawn by the GPU renderer in software"
+		}
+		if behind(h.gpu) {
+			h.path = "skipped to catch up with the display"
+			h.conn.Surface.RequestFrame()
+		}
 		return
 	}
-	h.soft.Render(s)
+	h.path = "drawn in memory"
+	damage := h.soft.Render(s)
 	m := &h.soft.Image
-	h.conn.Surface.PresentPixels(m.Pix, m.Stride, m.W, m.H)
+	if d, ok := h.conn.Surface.(platform.DamageSurface); ok {
+		d.PresentDamage(m.Pix, m.Stride, m.W, m.H, damage)
+	} else {
+		h.conn.Surface.PresentPixels(m.Pix, m.Stride, m.W, m.H)
+	}
 }
 
-// drawOnCPU draws s on the CPU and has the GPU renderer present it, when
-// it changes little (see pixelPresenter), and reports whether it did.
-func (h *windowHost) drawOnCPU(s *scene.Scene, burst bool) bool {
-	p, ok := h.gpu.(pixelPresenter)
+// ready tells the window, after the first frame, that it is ready to show:
+// once the frame returns, as its listeners may show the window.
+func (h *windowHost) ready() {
+	if h.shown {
+		return
+	}
+	h.shown = true
+	if h.conn.Ready != nil && h.conn.Post != nil {
+		h.conn.Post(h.conn.Ready)
+	}
+}
+
+// armIdle has idle run d from now, unless it runs sooner already.
+func (h *windowHost) armIdle(d time.Duration) {
+	if h.conn.Post == nil {
+		return
+	}
+	at := time.Now().Add(d)
+	if h.idleArmed && !h.idleAt.After(at) {
+		return
+	}
+	h.idleAt, h.idleArmed = at, true
+	if h.idleTimer == nil {
+		h.idleTimer = time.AfterFunc(d, func() { h.conn.Post(h.idle) })
+	} else {
+		h.idleTimer.Reset(d)
+	}
+}
+
+// idle runs on the main thread after frames stop: it frees the frame drawn
+// in memory, and has the surface give back memory, once the window is idle
+// for frameIdle. A frame since rearms it.
+func (h *windowHost) idle() {
+	h.idleArmed = false
+	if h.detached {
+		return
+	}
+	since := time.Since(h.lastFrame)
+	if since < frameIdle {
+		h.armIdle(frameIdle - since)
+		return
+	}
+	h.soft.Release()
+	if s, ok := h.conn.Surface.(platform.IdleSurface); ok {
+		s.Idle()
+	}
+}
+
+// useWide has the GPU renderer draw the colors of s outside the sRGB gamut
+// when the window shows them (see wideHold), and reports whether it does.
+func (h *windowHost) useWide(s *scene.Scene, now time.Time) bool {
+	w, ok := h.gpu.(wideRenderer)
 	if !ok {
 		return false
 	}
-	changed := h.soft.Changes(s)
-	if changed > cpuMaxPixels || burst && changed > s.Width*s.Height/16 {
-		return false
+	if len(s.Wide) > 0 {
+		h.wideUntil = now.Add(wideHold)
 	}
-	damage := h.soft.Render(s)
-	m := &h.soft.Image
-	if err := p.PresentPixels(m.Pix, m.Stride, m.W, m.H, float64(s.Scale), damage); err != nil {
-		log.Printf("mygo: presenting a frame drawn in memory: %v", err)
-		return false
+	if on := now.Before(h.wideUntil) && h.screenWide(); on != h.wide {
+		h.wide = w.SetWide(on)
 	}
-	return true
+	return h.wide
 }
 
-// dropCPUFrame frees the frame the CPU drew last once the GPU has drawn
-// alone for a second, as while it animates much of the window: the CPU
-// would draw the next frame whole anyway.
-func (h *windowHost) dropCPUFrame(now time.Time) {
-	if _, ok := h.gpu.(pixelPresenter); !ok {
-		return
-	}
-	if h.gpuSinceCPU.IsZero() {
-		h.gpuSinceCPU = now
-	} else if now.Sub(h.gpuSinceCPU) > time.Second && h.soft.Image.Pix != nil {
-		h.soft.Release()
-	}
+// screenWide reports whether the window's screen shows more than sRGB.
+func (h *windowHost) screenWide() bool {
+	w, ok := h.conn.Surface.(platform.WideGamutSurface)
+	return ok && w.WideGamut()
 }
 
 // render draws s with the GPU renderer and reports whether it did. One
@@ -260,12 +363,21 @@ func (h *windowHost) makeGPU() {
 		h.degraded = false
 	}
 	h.gpu, h.gpuSince = r, time.Now()
+	h.wide = false // the renderer draws sRGB until told otherwise
 }
 
 // software reports whether a renderer draws on the CPU, as Direct3D's WARP.
 func software(r gpuRenderer) bool {
 	s, ok := r.(interface{ Software() bool })
 	return ok && s.Software()
+}
+
+// behind reports whether r drew nothing of the last frame, to catch up
+// with the display (Metal's): the window draws another at the next
+// refresh.
+func behind(r gpuRenderer) bool {
+	b, ok := r.(interface{ Behind() bool })
+	return ok && b.Behind()
 }
 
 // retryLater has a frame make a GPU renderer again after a wait, which
@@ -293,6 +405,10 @@ func (h *windowHost) capture() (int, int, []byte) {
 }
 
 func (h *windowHost) detach() {
+	h.detached = true
+	if h.idleTimer != nil {
+		h.idleTimer.Stop()
+	}
 	h.rt.close()
 	h.soft.Release()
 	if h.gpu != nil {
@@ -303,11 +419,30 @@ func (h *windowHost) detach() {
 
 func (h *windowHost) requestFrame() { h.conn.Surface.RequestFrame() }
 
-// uiFont gives system-ui the desktop's interface font where the text
-// system does not know it.
+func (h *windowHost) startDataDrag(data transfer.Data, local any, options transfer.DragOptions, x, y float32) error {
+	return h.conn.StartDataDrag(data, local, options, float64(x), float64(y))
+}
+func (h *windowHost) cancelDataDrag()                    { h.conn.CancelDataDrag() }
+func (h *windowHost) setDropFormats(f []transfer.Format) { h.conn.Surface.SetDropFormats(f) }
+
+func (h *windowHost) post(fn func()) {
+	if h.conn.Post != nil {
+		h.conn.Post(fn)
+	} else {
+		h.conn.Invalidate()
+	}
+}
+
+// uiFont gives system-ui the desktop's interface font, and text the
+// desktop's settings for rasterizing it, where the text system does not
+// know them.
 func (h *windowHost) uiFont() {
 	if h.conn.UIFont != nil {
 		text.Shared().SetUIFamily(h.conn.UIFont())
+	}
+	if h.conn.FontRendering != nil {
+		r := h.conn.FontRendering()
+		text.Shared().SetFontRendering(r.Antialias, r.Hinting, r.Subpixels)
 	}
 }
 
@@ -344,7 +479,20 @@ func (h *windowHost) titleBarDoubleClicked() {
 	}
 }
 
+func (h *windowHost) escape() {
+	if h.conn.Escape != nil {
+		h.conn.Escape()
+	}
+}
+
 func (h *windowHost) isDark() bool { return h.conn.IsDark != nil && h.conn.IsDark() }
+
+func (h *windowHost) preferences() platform.Preferences {
+	if h.conn.Preferences == nil {
+		return platform.Preferences{}
+	}
+	return h.conn.Preferences()
+}
 
 func (h *windowHost) titleBar() TitleBar {
 	if h.conn.TitleBar == nil {
@@ -354,11 +502,50 @@ func (h *windowHost) titleBar() TitleBar {
 	return TitleBar{Height: float32(t.Height), Left: float32(t.Left), Right: float32(t.Right)}
 }
 
+func (h *windowHost) vibrancy() bool {
+	s, ok := h.conn.Surface.(platform.MaterialSurface)
+	return ok && s.ShowsMaterial()
+}
+
 func (h *windowHost) invalidate() { h.conn.Invalidate() }
 
-func (h *windowHost) openURL(u string) {
+func (h *windowHost) openURL(u string, done func(error)) {
 	if h.conn.OpenURL != nil {
-		h.conn.OpenURL(u)
+		h.conn.OpenURL(u, done)
+	}
+}
+
+// placeWebViews gives the surface where the frame shows the window's web
+// views, unless it is where the last frame showed them.
+func (h *windowHost) placeWebViews(views []placedWebView) {
+	list := make([]platform.WebViewPlacement, 0, len(views))
+	natives := make([]NativeWebView, 0, len(views))
+	for _, v := range views {
+		if n := v.v.SurfaceWebView(h.conn); n != nil {
+			list = append(list, platform.WebViewPlacement{WebView: n, Frame: v.frame, Clip: v.clip, Covers: v.covers})
+			natives = append(natives, v.v)
+		}
+	}
+	if slices.EqualFunc(list, h.placed, func(a, b platform.WebViewPlacement) bool {
+		return a.WebView == b.WebView && a.Frame == b.Frame && a.Clip == b.Clip && slices.Equal(a.Covers, b.Covers)
+	}) {
+		return
+	}
+	h.placed, h.views = list, natives
+	if h.conn.PlaceWebViews != nil {
+		h.conn.PlaceWebViews(list)
+	} else {
+		h.conn.Surface.PlaceWebViews(list)
+	}
+}
+
+func (h *windowHost) platformWebView(v NativeWebView) platform.WebView {
+	return v.SurfaceWebView(h.conn)
+}
+
+func (h *windowHost) tabIntoWebView(v NativeWebView, back bool) {
+	if n := v.SurfaceWebView(h.conn); n != nil {
+		n.TabInto(back)
 	}
 }
 

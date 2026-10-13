@@ -5,7 +5,6 @@ package windows
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -17,6 +16,7 @@ import (
 	"unsafe"
 
 	"github.com/egoist/mygo/internal/platform"
+	"github.com/egoist/mygo/transfer"
 )
 
 // Clipboard.
@@ -104,14 +104,7 @@ func (c clipboard) ReadText() string {
 	return string(utf16Decode(u))
 }
 
-func (c clipboard) WriteText(text string) {
-	if !c.open() {
-		return
-	}
-	defer closeClipboard()
-	procEmptyClipboard.Call()
-	setClipboardData(cfUnicodeText, utf16Bytes(text))
-}
+func (c clipboard) WriteText(text string) { _ = c.WriteData(transfer.TextData(text), nil) }
 
 // CF_HTML wraps a fragment in a header of byte offsets.
 func (c clipboard) ReadHTML() string {
@@ -145,6 +138,11 @@ func htmlOffset(data, key string) int {
 }
 
 func (c clipboard) WriteHTML(markup string) {
+	_ = c.WriteData(transfer.New(transfer.NewItem(transfer.Bytes(transfer.HTML, []byte(markup)), transfer.Bytes(transfer.Text, []byte(markup)))), nil)
+}
+
+// htmlData is shared by clipboard and drag representations.
+func htmlData(markup string) []byte {
 	const header = "Version:0.9\r\nStartHTML:%010d\r\nEndHTML:%010d\r\nStartFragment:%010d\r\nEndFragment:%010d\r\n"
 	prefix := "<html><body><!--StartFragment-->"
 	suffix := "<!--EndFragment--></body></html>"
@@ -152,13 +150,7 @@ func (c clipboard) WriteHTML(markup string) {
 	startFragment := h + len(prefix)
 	endFragment := startFragment + len(markup)
 	doc := fmt.Sprintf(header, h, endFragment+len(suffix), startFragment, endFragment) + prefix + markup + suffix
-	if !c.open() {
-		return
-	}
-	defer closeClipboard()
-	procEmptyClipboard.Call()
-	setClipboardData(cfHTML, append([]byte(doc), 0))
-	setClipboardData(cfUnicodeText, utf16Bytes(markup))
+	return append([]byte(doc), 0)
 }
 
 func (c clipboard) ReadImage() []byte {
@@ -181,18 +173,10 @@ func (c clipboard) ReadImage() []byte {
 }
 
 func (c clipboard) WriteImage(data []byte) error {
-	img, err := png.Decode(bytes.NewReader(data))
-	if err != nil {
+	if _, err := png.Decode(bytes.NewReader(data)); err != nil {
 		return err
 	}
-	if !c.open() {
-		return errors.New("mygo: the clipboard is busy")
-	}
-	defer closeClipboard()
-	procEmptyClipboard.Call()
-	setClipboardData(cfPNG, data)
-	setClipboardData(cfDIB, imageToDIB(img)) // for programs without PNG support
-	return nil
+	return c.WriteData(transfer.New(transfer.NewItem(transfer.Bytes(transfer.PNG, data))), nil)
 }
 
 // dibToImage decodes an uncompressed 24 or 32-bit device independent
@@ -209,6 +193,9 @@ func dibToImage(dib []byte) image.Image {
 		return nil
 	}
 	offset := int(headerSize)
+	if offset < 40 || offset > len(dib) {
+		return nil
+	}
 	if compression == 3 && headerSize == 40 {
 		offset += 12 // BI_BITFIELDS masks
 	}
@@ -216,8 +203,13 @@ func dibToImage(dib []byte) image.Image {
 	if !bottomUp {
 		height = -height
 	}
+	// Clipboard bitmap dimensions are untrusted. Bound output and check
+	// division before multiplication, including the INT_MIN height case.
+	if width > (64<<20)/4 || height > (64<<20)/(4*width) {
+		return nil
+	}
 	stride := ((width*int(bits) + 31) / 32) * 4
-	if len(dib) < offset+stride*height {
+	if offset > len(dib) || height > (len(dib)-offset)/stride {
 		return nil
 	}
 	img := image.NewNRGBA(image.Rect(0, 0, width, height))
@@ -263,41 +255,13 @@ func imageToDIB(img image.Image) []byte {
 	return out
 }
 
-func (c clipboard) Clear() {
-	if !c.open() {
-		return
-	}
-	defer closeClipboard()
-	procEmptyClipboard.Call()
-}
-
+func (c clipboard) Clear() { _ = c.WriteData(transfer.Data{}, nil) }
 func (c clipboard) AvailableFormats() []string {
-	if !c.open() {
-		return nil
-	}
-	defer closeClipboard()
-	seen := map[string]bool{}
 	var out []string
-	add := func(s string) {
-		if !seen[s] {
-			seen[s] = true
-			out = append(out, s)
-		}
+	for _, f := range c.Formats() {
+		out = append(out, string(f))
 	}
-	for f := uintptr(0); ; {
-		f, _, _ = procEnumClipboardFormats.Call(f)
-		if f == 0 {
-			return out
-		}
-		switch uint32(f) {
-		case cfUnicodeText, 1: // CF_TEXT
-			add("text/plain")
-		case cfHTML:
-			add("text/html")
-		case cfPNG, cfDIB, cfDIBV5:
-			add("image/png")
-		}
-	}
+	return out
 }
 
 // Shell.
@@ -408,9 +372,70 @@ func (t theme) IsDark() bool { return t.b.isDark() }
 // UIFont is DirectWrite's to find: Segoe UI.
 func (theme) UIFont() string { return "" }
 
+func (theme) FontRendering() platform.FontRendering { return platform.FontRendering{} }
+
 func (t theme) SetSource(source string) {
 	t.b.themeSource = source
 	t.b.applyTheme()
+}
+
+const (
+	spiGetHighContrast        = 0x0042
+	spiSetHighContrast        = 0x0043
+	spiGetClientAreaAnimation = 0x1042
+	spiSetClientAreaAnimation = 0x1043
+	hcfHighContrastOn         = 0x1
+	accessibilityKey          = `Software\Microsoft\Accessibility`
+	dwmKey                    = `Software\Microsoft\Windows\DWM`
+	textScaleFactor           = "TextScaleFactor"
+	settingImmersiveColorSet  = "ImmersiveColorSet"
+	settingWindowMetrics      = "WindowMetrics"
+)
+
+// highContrast is HIGHCONTRASTW.
+type highContrast struct {
+	size, flags   uint32
+	defaultScheme uintptr
+}
+
+// Preferences reads the accent of the title bars and the Start menu, the
+// settings of animation effects and contrast themes, and the size of
+// text of Accessibility.
+func (t theme) Preferences() platform.Preferences {
+	var p platform.Preferences
+	if v, ok := regDWORD(hkeyCurrentUser, dwmKey, "AccentColor"); ok { // 0xAABBGGRR
+		p.Accent = platform.Color{R: uint8(v), G: uint8(v >> 8), B: uint8(v >> 16), A: 255}
+	}
+	var animate int32
+	if r, _, _ := procSystemParametersInfoW.Call(spiGetClientAreaAnimation, 0, uintptr(unsafe.Pointer(&animate)), 0); r != 0 {
+		p.ReduceMotion = animate == 0
+	}
+	hc := highContrast{size: uint32(unsafe.Sizeof(highContrast{}))}
+	if r, _, _ := procSystemParametersInfoW.Call(spiGetHighContrast, uintptr(hc.size), uintptr(unsafe.Pointer(&hc)), 0); r != 0 {
+		p.HighContrast = hc.flags&hcfHighContrastOn != 0
+	}
+	if v, ok := regDWORD(hkeyCurrentUser, accessibilityKey, textScaleFactor); ok && v >= 100 && v <= 500 {
+		p.TextScale = float64(v) / 100
+	}
+	return p
+}
+
+// preferencesChanged reports whether a WM_SETTINGCHANGE is about the
+// preferences: the colors, animation effects, contrast themes or the size
+// of text.
+func preferencesChanged(wp, lp uintptr) bool {
+	switch wp {
+	case spiSetClientAreaAnimation, spiSetHighContrast:
+		return true
+	}
+	if lp == 0 {
+		return false
+	}
+	switch wstr(lp) {
+	case settingImmersiveColorSet, settingWindowMetrics, textScaleFactor:
+		return true
+	}
+	return false
 }
 
 func (b *Backend) isDark() bool {

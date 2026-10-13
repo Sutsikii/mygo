@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo/internal/platform"
+	"github.com/egoist/mygo/transfer"
 )
 
 // ErrNoReply makes Window.CallAsyncFunction never call back, like a
@@ -27,13 +28,20 @@ type Backend struct {
 	wake   chan struct{}
 	quit   chan struct{}
 
-	mu        sync.Mutex
-	windows   []*Window
-	appMenu   *platform.Menu
-	updates   []*platform.MenuItem
-	hotkeys   map[int]string
-	clipboard string
-	theme     string
+	mu               sync.Mutex
+	windows          []*Window
+	appMenu          *platform.Menu
+	updates          []*platform.MenuItem
+	hotkeys          map[int]string
+	clipboard        transfer.Data
+	clipboardRelease func()
+	// ClipboardError injects a failed write while preserving existing ownership.
+	ClipboardError error
+	// ClipboardDuringFlush simulates a toolkit pumping a nested event loop
+	// after releasing providers but before its storage operation returns.
+	ClipboardDuringFlush func()
+	theme                string
+	prefs                platform.Preferences
 	// Watching reports whether power events were asked for, Awake counts the
 	// KeepAwake calls not released yet.
 	Watching bool
@@ -50,6 +58,12 @@ type Backend struct {
 	OpenResult    []string
 	SaveResult    string
 	MessageResult platform.MessageBoxResult
+	// NotificationError, when set, is what showing a notification fails
+	// with.
+	NotificationError error
+	// notifications are the notifications shown and not yet removed, by
+	// id.
+	notifications map[string]*platform.Notification
 }
 
 // New creates a fake backend.
@@ -150,10 +164,38 @@ func (b *Backend) NewWindow(o *platform.WindowOptions, h platform.WindowHandler)
 		// Three buttons 46 wide at the top right, as on Windows.
 		w.TitleBarRoom = platform.TitleBar{Height: cmp.Or(o.TitleBarHeight, 32), Right: 138}
 	}
+	if o.Flyout != nil {
+		w.place(*o.Flyout, platform.Size{Width: o.Width, Height: o.Height})
+	}
 	b.mu.Lock()
 	b.windows = append(b.windows, w)
 	b.mu.Unlock()
 	return w, nil
+}
+
+// PlaceFlyout places a flyout as the real backends do, against the
+// parent's content area and the fake display's work area.
+func (w *Window) PlaceFlyout(f platform.Flyout, size platform.Size) {
+	if w.Opts.Flyout == nil {
+		return
+	}
+	w.place(f, size)
+	w.H.Moved()
+}
+
+func (w *Window) place(f platform.Flyout, size platform.Size) {
+	anchor := f.Anchor
+	if f.Tray != nil {
+		anchor = f.Tray.Bounds()
+	} else if p, ok := w.Opts.Parent.(*Window); ok {
+		c := p.ContentBounds()
+		anchor.X += c.X
+		anchor.Y += c.Y
+	}
+	r, _, _ := f.Place(anchor, size, platform.WorkAreaFor(anchor, screen{}.Displays()))
+	w.mu.Lock()
+	w.Flyout, w.bounds = f, r
+	w.mu.Unlock()
 }
 
 // AppMenu returns the last application menu.
@@ -172,6 +214,9 @@ func (b *Backend) MenuUpdates() []*platform.MenuItem {
 
 // ClickMenuItem simulates choosing a menu item.
 func (b *Backend) ClickMenuItem(id int) { b.h.MenuItemClicked(id) }
+
+// ClickMenuItem simulates choosing an item of this window's menu.
+func (w *Window) ClickMenuItem(id int) { w.H.MenuItemClicked(id) }
 
 func (b *Backend) SetApplicationMenu(m *platform.Menu) {
 	b.mu.Lock()
@@ -227,15 +272,74 @@ func (b *Backend) PressHotkey(acc string) {
 	}
 }
 
-func (b *Backend) NotificationsSupported() bool                  { return false }
-func (b *Backend) ShowNotification(*platform.Notification) error { return platform.ErrUnsupported }
-func (b *Backend) RemoveNotification(string)                     {}
+// Notifications are recorded rather than shown, so that a test can see
+// what the app asked for and report a click as a platform does.
+func (b *Backend) NotificationsSupported() bool { return true }
+
+func (b *Backend) ShowNotification(n *platform.Notification, done func(error)) {
+	b.mu.Lock()
+	if err := b.NotificationError; err != nil {
+		b.mu.Unlock()
+		done(err)
+		return
+	}
+	if b.notifications == nil {
+		b.notifications = map[string]*platform.Notification{}
+	}
+	// A copy, as a real backend keeps its own.
+	c := *n
+	b.notifications[n.ID] = &c
+	b.mu.Unlock()
+	done(nil)
+}
+
+func (b *Backend) RemoveNotification(id string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	delete(b.notifications, id)
+}
+
+func (b *Backend) RemoveAllNotifications() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	clear(b.notifications)
+}
+
+// Delivered adds a notification the platform still shows from an earlier
+// run of the app, which the app did not show in this one.
+func (b *Backend) Delivered(n *platform.Notification) {
+	b.ShowNotification(n, func(error) {})
+}
+
+// Notifications returns the notifications shown and not yet removed.
+func (b *Backend) Notifications() []*platform.Notification {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]*platform.Notification, 0, len(b.notifications))
+	for _, n := range b.notifications {
+		out = append(out, n)
+	}
+	return out
+}
+
+// Notification returns the notification with an id, or nil.
+func (b *Backend) Notification(id string) *platform.Notification {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.notifications[id]
+}
+
+// ClickNotification reports a click on a notification, as the platform
+// does. It runs on the main thread, like the backends report it.
+func (b *Backend) ClickNotification(id string) { b.h.NotificationClicked(id) }
 
 // Window is a fake native window. Scripts evaluated in it are recorded.
 type Window struct {
 	b    *Backend
 	H    platform.WindowHandler
 	Opts *platform.WindowOptions
+	// Flyout is how a flyout was placed last.
+	Flyout platform.Flyout
 
 	mu        sync.Mutex
 	scripts   []string
@@ -254,6 +358,8 @@ type Window struct {
 	Dropped []string
 	// PDF holds the options of the last PrintToPDF.
 	PDF platform.PDFOptions
+	// HTML holds the documents LoadHTML loaded, in order.
+	HTML []string
 	// What the window extras were last set to.
 	Background      platform.Color
 	Progress        string
@@ -360,24 +466,29 @@ func (w *Window) SetBounds(r platform.Rect) {
 	w.mu.Unlock()
 	w.H.Resized()
 }
-func (w *Window) Bounds() platform.Rect              { w.mu.Lock(); defer w.mu.Unlock(); return w.bounds }
-func (w *Window) SetContentBounds(r platform.Rect)   { w.SetBounds(r) }
-func (w *Window) ContentBounds() platform.Rect       { return w.Bounds() }
-func (w *Window) SetMinimumSize(platform.Size)       {}
-func (w *Window) SetMaximumSize(platform.Size)       {}
-func (w *Window) SetResizable(bool)                  {}
-func (w *Window) IsResizable() bool                  { return w.Opts.Resizable }
-func (w *Window) SetMovable(bool)                    {}
-func (w *Window) IsMovable() bool                    { return w.Opts.Movable }
-func (w *Window) SetMinimizable(bool)                {}
-func (w *Window) IsMinimizable() bool                { return w.Opts.Minimizable }
-func (w *Window) SetMaximizable(bool)                {}
-func (w *Window) IsMaximizable() bool                { return w.Opts.Maximizable }
-func (w *Window) SetClosable(bool)                   {}
-func (w *Window) IsClosable() bool                   { return w.Opts.Closable }
-func (w *Window) SetAlwaysOnTop(bool)                {}
-func (w *Window) IsAlwaysOnTop() bool                { return w.Opts.AlwaysOnTop }
-func (w *Window) Show()                              { w.mu.Lock(); w.visible, w.focused = true, true; w.mu.Unlock() }
+func (w *Window) Bounds() platform.Rect            { w.mu.Lock(); defer w.mu.Unlock(); return w.bounds }
+func (w *Window) SetContentBounds(r platform.Rect) { w.SetBounds(r) }
+func (w *Window) ContentBounds() platform.Rect     { return w.Bounds() }
+func (w *Window) SetMinimumSize(platform.Size)     {}
+func (w *Window) SetMaximumSize(platform.Size)     {}
+func (w *Window) SetResizable(bool)                {}
+func (w *Window) IsResizable() bool                { return w.Opts.Resizable }
+func (w *Window) SetMovable(bool)                  {}
+func (w *Window) IsMovable() bool                  { return w.Opts.Movable }
+func (w *Window) SetMinimizable(bool)              {}
+func (w *Window) IsMinimizable() bool              { return w.Opts.Minimizable }
+func (w *Window) SetMaximizable(bool)              {}
+func (w *Window) IsMaximizable() bool              { return w.Opts.Maximizable }
+func (w *Window) SetClosable(bool)                 {}
+func (w *Window) IsClosable() bool                 { return w.Opts.Closable }
+func (w *Window) SetAlwaysOnTop(bool)              {}
+func (w *Window) IsAlwaysOnTop() bool              { return w.Opts.AlwaysOnTop }
+func (w *Window) Show() {
+	w.mu.Lock()
+	w.visible = true
+	w.focused = w.focused || w.Opts.Flyout == nil || w.Opts.Flyout.Focusable
+	w.mu.Unlock()
+}
 func (w *Window) ShowInactive()                      { w.mu.Lock(); w.visible = true; w.mu.Unlock() }
 func (w *Window) Hide()                              { w.mu.Lock(); w.visible = false; w.mu.Unlock() }
 func (w *Window) IsVisible() bool                    { w.mu.Lock(); defer w.mu.Unlock(); return w.visible }
@@ -404,7 +515,7 @@ func (w *Window) SetMenu(*platform.Menu)             {}
 func (w *Window) StartDrag()                         {}
 func (w *Window) TitleBarDoubleClicked()             {}
 func (w *Window) LoadURL(url string)                 { w.mu.Lock(); w.url = url; w.mu.Unlock() }
-func (w *Window) LoadHTML(string, string)            { w.mu.Lock(); w.url = "about:blank"; w.mu.Unlock() }
+func (w *Window) LoadHTML(html, _ string)            { w.addHTML(html) }
 func (w *Window) LoadFile(path, _ string)            { w.mu.Lock(); w.url = "file://" + path; w.mu.Unlock() }
 func (w *Window) Reload(bool)                        {}
 func (w *Window) StopLoading()                       {}
@@ -423,6 +534,14 @@ func (w *Window) CloseDevTools()                     { w.mu.Lock(); w.devtools =
 func (w *Window) IsDevToolsOpened() bool             { w.mu.Lock(); defer w.mu.Unlock(); return w.devtools }
 func (w *Window) CapturePage(cb func([]byte, error)) { cb([]byte("png"), nil) }
 func (w *Window) Print()                             {}
+
+// addHTML records a document LoadHTML loads.
+func (w *Window) addHTML(html string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.HTML = append(w.HTML, html)
+	w.url = "about:blank"
+}
 
 func (w *Window) Eval(js string) {
 	if w.OnEval != nil {
@@ -458,6 +577,7 @@ func (w *Window) Close() {
 	}
 	w.closed = true
 	w.mu.Unlock()
+	w.closeWebViews()
 	w.H.Closed()
 }
 
@@ -550,22 +670,75 @@ func (d dialogs) ShowMessageBox(_ platform.Window, _ *platform.MessageBoxOptions
 
 type clipboard struct{ b *Backend }
 
-func (c clipboard) ReadText() string {
-	c.b.mu.Lock()
-	defer c.b.mu.Unlock()
-	return c.b.clipboard
+func (c clipboard) ReadText() string   { b, _ := c.b.clipboard.Read(transfer.Text); return string(b) }
+func (c clipboard) WriteText(s string) { _ = c.WriteData(transfer.TextData(s), nil) }
+func (c clipboard) ReadHTML() string   { b, _ := c.b.clipboard.Read(transfer.HTML); return string(b) }
+func (c clipboard) WriteHTML(s string) {
+	_ = c.WriteData(transfer.New(transfer.NewItem(transfer.Bytes(transfer.HTML, []byte(s)))), nil)
 }
-func (c clipboard) WriteText(s string) {
-	c.b.mu.Lock()
-	c.b.clipboard = s
-	c.b.mu.Unlock()
+func (c clipboard) ReadImage() []byte { b, _ := c.b.clipboard.Read(transfer.PNG); return b }
+func (c clipboard) WriteImage(b []byte) error {
+	return c.WriteData(transfer.New(transfer.NewItem(transfer.Bytes(transfer.PNG, b))), nil)
 }
-func (clipboard) ReadHTML() string           { return "" }
-func (clipboard) WriteHTML(string)           {}
-func (clipboard) ReadImage() []byte          { return nil }
-func (clipboard) WriteImage([]byte) error    { return nil }
-func (c clipboard) Clear()                   { c.WriteText("") }
-func (clipboard) AvailableFormats() []string { return nil }
+func (c clipboard) Clear() { _ = c.WriteData(transfer.Data{}, nil) }
+func (c clipboard) AvailableFormats() []string {
+	var out []string
+	for _, f := range c.Formats() {
+		out = append(out, string(f))
+	}
+	return out
+}
+func (c clipboard) Formats() []transfer.Format { return c.b.clipboard.Formats() }
+func (c clipboard) ReadData(formats []transfer.Format) (transfer.Data, error) {
+	if len(formats) == 0 {
+		formats = c.Formats()
+		if len(formats) == 0 {
+			return transfer.Data{}, nil
+		}
+	}
+	return c.b.clipboard.Materialize(formats)
+}
+func (c clipboard) WriteData(d transfer.Data, released func()) error {
+	if c.b.ClipboardError != nil {
+		return c.b.ClipboardError
+	}
+	previous := c.b.clipboardRelease
+	c.b.clipboard, c.b.clipboardRelease = d, released
+	if previous != nil {
+		previous()
+	}
+	if len(d.Formats()) == 0 {
+		c.release()
+	}
+	return nil
+}
+func (c clipboard) release() {
+	if fn := c.b.clipboardRelease; fn != nil {
+		c.b.clipboardRelease = nil
+		fn()
+	}
+}
+func (c clipboard) Flush() error {
+	if len(c.Formats()) == 0 {
+		return nil
+	}
+	d, err := c.ReadData(nil)
+	if err != nil {
+		return err
+	}
+	c.b.clipboard = d
+	c.release()
+	if fn := c.b.ClipboardDuringFlush; fn != nil {
+		fn()
+	}
+	return nil
+}
+func (c clipboard) Close() {
+	if c.b.clipboardRelease != nil {
+		c.b.clipboard = transfer.Data{}
+		c.release()
+	}
+}
 
 type shell struct{}
 
@@ -610,11 +783,28 @@ func (t theme) IsDark() bool {
 }
 func (theme) UIFont() string { return "" }
 
+func (theme) FontRendering() platform.FontRendering { return platform.FontRendering{} }
+
 func (t theme) SetSource(s string) {
 	t.b.mu.Lock()
 	t.b.theme = s
 	t.b.mu.Unlock()
 	t.b.h.ThemeChanged()
+}
+
+func (t theme) Preferences() platform.Preferences {
+	t.b.mu.Lock()
+	defer t.b.mu.Unlock()
+	return t.b.prefs
+}
+
+// SetPreferences changes the desktop's preferences, as the user does in
+// the system's settings.
+func (b *Backend) SetPreferences(p platform.Preferences) {
+	b.mu.Lock()
+	b.prefs = p
+	b.mu.Unlock()
+	b.h.ThemeChanged()
 }
 
 type tray struct{}
@@ -624,8 +814,10 @@ func (*tray) SetTitle(string)             {}
 func (*tray) SetToolTip(string)           {}
 func (*tray) SetMenu(*platform.Menu)      {}
 func (*tray) PopUpMenu(*platform.Menu)    {}
-func (*tray) Bounds() platform.Rect       { return platform.Rect{} }
-func (*tray) Destroy()                    {}
+
+// Bounds puts the icon in the menu bar above the fake display's work area.
+func (*tray) Bounds() platform.Rect { return platform.Rect{X: 1300, Width: 30, Height: 25} }
+func (*tray) Destroy()              {}
 
 // Surface is a fake window surface: it records what the content asks of
 // it, and tests deliver events through Send.
@@ -634,16 +826,42 @@ type Surface struct {
 	// Scale is the device pixels per DIP.
 	Scale float64
 
-	mu        sync.Mutex
-	requests  int
-	frames    int
-	pixels    []byte
-	pixW      int
-	pixH      int
-	cursor    platform.Cursor
-	textInput platform.TextInputState
-	access    *platform.AccessTree
-	accessN   int
+	mu          sync.Mutex
+	requests    int
+	frames      int
+	pixels      []byte
+	pixW        int
+	pixH        int
+	cursor      platform.Cursor
+	textInput   platform.TextInputState
+	access      *platform.AccessTree
+	accessN     int
+	rate        float64
+	dataDrag    *platform.DragRequest
+	dropFormats []transfer.Format
+	// webViews are those made (webview.go), order those shown in the
+	// order the content painted them, and placements counts
+	// PlaceWebViews.
+	webViews   []*WebView
+	order      []*WebView
+	placements int
+}
+
+func (s *Surface) StartDataDrag(r platform.DragRequest) { s.dataDrag = &r }
+func (s *Surface) CancelDataDrag()                      { s.FinishDataDrag(transfer.Result{Canceled: true}) }
+func (s *Surface) SetDropFormats(f []transfer.Format) {
+	s.dropFormats = append([]transfer.Format(nil), f...)
+}
+
+// DataDrag returns the active native-source request. Main thread only.
+func (s *Surface) DataDrag() *platform.DragRequest { return s.dataDrag }
+
+// FinishDataDrag delivers the native source's result once. Main thread only.
+func (s *Surface) FinishDataDrag(r transfer.Result) {
+	if d := s.dataDrag; d != nil {
+		s.dataDrag = nil
+		d.Done(r)
+	}
 }
 
 func (s *Surface) Native() platform.SurfaceNative { return platform.SurfaceNative{} }
@@ -652,6 +870,24 @@ func (s *Surface) Size() (float64, float64, float64) {
 	s.w.mu.Lock()
 	defer s.w.mu.Unlock()
 	return float64(s.w.bounds.Width), float64(s.w.bounds.Height), s.Scale
+}
+
+// RefreshRate returns the display's refresh rate, 60 unless
+// SetRefreshRate set another.
+func (s *Surface) RefreshRate() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.rate == 0 {
+		return 60
+	}
+	return s.rate
+}
+
+// SetRefreshRate sets the display's refresh rate.
+func (s *Surface) SetRefreshRate(hz float64) {
+	s.mu.Lock()
+	s.rate = hz
+	s.mu.Unlock()
 }
 
 func (s *Surface) RequestFrame() {

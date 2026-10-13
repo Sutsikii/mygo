@@ -2,10 +2,13 @@ package text
 
 import (
 	"encoding/binary"
+	"image"
 	"math"
 	"slices"
+	"strings"
 	"sync"
 	"unicode"
+	"unsafe"
 
 	"github.com/egoist/mygo/internal/scene"
 )
@@ -224,6 +227,7 @@ type Layout struct {
 	// Width is the width of the longest line, Height the sum of the line
 	// heights.
 	Width, Height float32
+	boundaries    []int // retained whole-grapheme offsets for visual navigation
 	// Truncated reports that MaxLines cut the text.
 	Truncated bool
 }
@@ -242,7 +246,9 @@ type Line struct {
 	RTL    bool
 	Glyphs []Glyph
 
-	carets []float32
+	carets   []float32
+	stops    []caretStop
+	upstream []float32
 }
 
 // Glyph is a positioned glyph.
@@ -251,7 +257,8 @@ type Glyph struct {
 	ID   uint32
 	// Size is the font size in DIPs.
 	Size float32
-	// X is the left of the glyph's advance box, Y its baseline.
+	// X is the glyph's drawing origin, including shaping offsets, Y its
+	// baseline. Advance moves the pen independently of those offsets.
 	X, Y    float32
 	Advance float32
 	// Cluster is the first rune of the glyph's cluster, Runes how many
@@ -266,16 +273,28 @@ type System struct {
 	mu  sync.Mutex
 	eng engine
 	// uiFamily is the family system-ui stands for where the engine does
-	// not know it (SetUIFamily).
-	uiFamily string
+	// not know it (SetUIFamily), and rendering the desktop's settings for
+	// rasterizing text, if the app gave them (SetFontRendering).
+	uiFamily  string
+	rendering *[3]string
 	// fonts caches the font of each style.
 	fonts map[Style]*Font
 
-	layouts map[Params]*cached
-	frame   uint64
+	// Layouts are kept by recency within a memory budget, not by how
+	// many frames a scrolling window has drawn.
+	layouts        map[Params]*cached
+	oldest, newest *cached
+	layoutBytes    int
+	frame          uint64
+	// made counts the layouts made (LayoutsMade), and gen the times the
+	// system forgot its layouts (Generation).
+	made, gen uint64
 
 	glyphs map[glyphKey]*atlasEntry
-	masks  map[uint64]*atlasEntry
+	places map[placeKey]placement
+	// runs holds joined glyphs (GlyphRun).
+	runs  map[runKey]*atlasEntry
+	masks map[uint64]*atlasEntry
 	// transient holds the masks drawn for the frame being painted alone,
 	// recent the frame each of them was last drawn in.
 	transient map[uint64]GlyphImage
@@ -285,30 +304,59 @@ type System struct {
 	// full tells which atlases (mask, color) left out something the frame
 	// draws, and want how many pixels that needed; failed counts failed
 	// allocations.
-	full   [2]bool
-	want   [2]int
-	failed int
+	full [2]bool
+	want [2]int
+	// wantSize is the largest bitmap left out of each atlas, including
+	// padding: area alone does not tell whether a long, thin mask fits.
+	wantSize [2]image.Point
+	failed   int
+	// subpixel tells that the system's settings ask for subpixel
+	// antialiasing (TextParams).
+	subpixel bool
 	// rooms counts MakeRoom calls during the frame.
 	rooms int
+	// Buffers layouts reuse: the first runes of clusters (line), and the
+	// advances and text of a line ending with an ellipsis (ellipsize).
+	starts     []int
+	advances   []float32
+	ellipsized []rune
+	// marks caches the width of the ellipsis of each style.
+	marks map[markKey]float32
 }
 
+type markKey struct {
+	style Style
+	mark  string // Params.Ellipsis
+	rtl   bool
+}
+
+// cached is a layout, with room for one line, as most layouts have, and
+// the frame that used it last.
 type cached struct {
-	layout *Layout
-	used   uint64
+	layout     Layout
+	line       [1]Line
+	used       uint64
+	bytes      int
+	prev, next *cached
 }
 
 var shared = sync.OnceValue(newSystem)
 
 func newSystem() *System {
 	return &System{
-		fonts:      map[Style]*Font{},
-		layouts:    map[Params]*cached{},
-		glyphs:     map[glyphKey]*atlasEntry{},
-		masks:      map[uint64]*atlasEntry{},
-		transient:  map[uint64]GlyphImage{},
-		recent:     map[uint64]uint64{},
-		MaskAtlas:  scene.NewAtlas(1, 1024, 1024),
-		ColorAtlas: scene.NewAtlas(4, 512, 512),
+		fonts:     map[Style]*Font{},
+		layouts:   map[Params]*cached{},
+		marks:     map[markKey]float32{},
+		glyphs:    map[glyphKey]*atlasEntry{},
+		places:    map[placeKey]placement{},
+		runs:      map[runKey]*atlasEntry{},
+		masks:     map[uint64]*atlasEntry{},
+		transient: map[uint64]GlyphImage{},
+		recent:    map[uint64]uint64{},
+		MaskAtlas: scene.NewAtlas(1, 256, 256),
+		// Most interfaces have no color or subpixel glyphs. Keep just a
+		// transparent texel until one asks for room.
+		ColorAtlas: scene.NewAtlas(4, 1, 1),
 	}
 }
 
@@ -321,6 +369,10 @@ func (s *System) engine() engine {
 		s.eng = newEngine()
 		if u, ok := s.eng.(uiFamilySetter); ok {
 			u.setUIFamily(s.uiFamily)
+		}
+		if f, ok := s.eng.(fontRenderer); ok && s.rendering != nil {
+			r := s.rendering
+			f.setFontRendering(r[0], r[1], r[2])
 		}
 	}
 	return s.eng
@@ -341,6 +393,38 @@ type fontForgetter interface {
 // interface font from the app.
 type uiFamilySetter interface{ setUIFamily(family string) }
 
+// fontRenderer is an engine that takes the desktop's settings for
+// rasterizing text from the app (platform.FontRendering).
+type fontRenderer interface {
+	setFontRendering(antialias, hinting, subpixels string)
+}
+
+// SetFontRendering sets how text is rasterized where the system's text
+// stack does not know the desktop's settings, as Pango on Linux:
+// antialiasing ("none", "gray" or "subpixel"), hinting ("none", "slight",
+// "medium" or "full") and the order of the screen's subpixels ("rgb",
+// "bgr", "vrgb" or "vbgr"), "" for the default. Other engines ignore it.
+func (s *System) SetFontRendering(antialias, hinting, subpixels string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	r := [3]string{antialias, hinting, subpixels}
+	if s.rendering != nil && *s.rendering == r {
+		return
+	}
+	s.rendering = &r
+	// An engine started already takes them now, and forgets what it drew.
+	if f, ok := s.eng.(fontRenderer); ok {
+		f.setFontRendering(antialias, hinting, subpixels)
+		s.gen++
+		clear(s.fonts)
+		s.clearLayouts()
+		clear(s.marks)
+		clear(s.glyphs)
+		clear(s.places)
+		clear(s.runs)
+	}
+}
+
 // SetUIFamily sets the family "system-ui" stands for where the system's
 // text stack does not know the desktop's interface font, as Pango on
 // Linux, which finds fontconfig's default sans-serif. Other engines ignore
@@ -355,8 +439,10 @@ func (s *System) SetUIFamily(family string) {
 	// An engine started already takes it now, and forgets what it found.
 	if u, ok := s.eng.(uiFamilySetter); ok {
 		u.setUIFamily(family)
+		s.gen++
 		clear(s.fonts)
-		clear(s.layouts)
+		s.clearLayouts()
+		clear(s.marks)
 	}
 }
 
@@ -369,8 +455,10 @@ func (s *System) RegisterFont(data []byte, family string) error {
 	if err := s.engine().register(data, family); err != nil {
 		return err
 	}
+	s.gen++
 	clear(s.fonts)
-	clear(s.layouts)
+	s.clearLayouts()
+	clear(s.marks)
 	return nil
 }
 
@@ -400,19 +488,21 @@ func (s *System) EndFrame() {
 		// with what refers to them. The atlas takes back the room of their
 		// glyphs as it makes room; the next frame lays out and draws its
 		// text anew.
-		clear(s.layouts)
+		s.gen++
+		s.clearLayouts()
+		clear(s.marks)
 		clear(s.fonts)
 		clear(s.glyphs)
+		clear(s.places)
+		clear(s.runs)
 		f.forgetFonts()
 		return
 	}
-	if s.frame%64 != 0 && len(s.layouts) < 4096 {
-		return
+	for s.oldest != nil && s.overLayoutBudget(0) {
+		s.removeLayout(s.oldest)
 	}
-	for p, c := range s.layouts {
-		if s.frame-c.used > 240 {
-			delete(s.layouts, p)
-		}
+	for s.oldest != nil && s.frame-s.oldest.used > 240 {
+		s.removeLayout(s.oldest)
 	}
 }
 
@@ -422,12 +512,138 @@ func (s *System) Layout(p Params) *Layout {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if c, ok := s.layouts[p]; ok {
-		c.used = s.frame
-		return c.layout
+		s.useLayout(c)
+		return &c.layout
 	}
-	l := s.layout(p)
-	s.layouts[p] = &cached{l, s.frame}
-	return l
+	// A short label may be a slice of a large document. Cache owned strings
+	// so the memory estimate reflects what those parameters keep alive.
+	p.Text = strings.Clone(p.Text)
+	p.Spans = strings.Clone(p.Spans)
+	p.Ellipsis = strings.Clone(p.Ellipsis)
+	p.Style.Family = strings.Clone(p.Style.Family)
+	p.Style.Features = strings.Clone(p.Style.Features)
+	c := s.layout(p)
+	c.bytes = layoutBytes(c)
+	// A large paragraph still lays out correctly; keeping it would evict
+	// all the ordinary labels and lines of other windows.
+	if c.bytes <= maxLayoutBytes {
+		for s.oldest != nil && (s.overLayoutBudget(c.bytes) || len(s.layouts) >= maxLayouts) {
+			s.removeLayout(s.oldest)
+		}
+		s.layouts[p] = c
+		s.layoutBytes += c.bytes
+		s.useLayout(c)
+	}
+	return &c.layout
+}
+
+// The memory estimate includes text, shaped glyphs and room for lazy caret
+// geometry. A count limit also bounds the map for many very short labels.
+const (
+	liveLayoutFrames   = 8
+	maxLiveLayoutBytes = 64 << 20
+	maxLayoutBytes     = 8 << 20
+	maxLayouts         = 4096
+)
+
+// Above the ordinary budget, keep layouts used within a few global frames:
+// otherwise sequential reuse of a larger working set evicts each layout just
+// before its next use. The hard cap and entry limit still apply to live text.
+// EndFrame also trims excess once later frames stop using it; no timer runs
+// while all windows are idle.
+func (s *System) overLayoutBudget(n int) bool {
+	return s.layoutBytes+n > maxLiveLayoutBytes ||
+		s.layoutBytes+n > maxLayoutBytes && s.oldest != nil && s.frame-s.oldest.used >= liveLayoutFrames
+}
+
+func layoutBytes(c *cached) int {
+	l, p := &c.layout, c.layout.Params
+	n := int(unsafe.Sizeof(*c)+unsafe.Sizeof(p)) + len(p.Text) + len(p.Spans) + len(p.Ellipsis) + len(p.Style.Family) + len(p.Style.Features)
+	n += cap(l.Runes) * int(unsafe.Sizeof(rune(0)))
+	if cap(l.Lines) > 1 {
+		n += cap(l.Lines) * int(unsafe.Sizeof(Line{}))
+	}
+	// Selection can create boundaries, caret positions and visual stops
+	// after insertion; reserve their room before caching the layout.
+	n += (len(l.Runes) + 1) * int(unsafe.Sizeof(int(0)))
+	for _, line := range l.Lines {
+		n += cap(line.Glyphs) * int(unsafe.Sizeof(Glyph{}))
+		n += (line.End - line.Start + 1) * 2 * int(unsafe.Sizeof(float32(0))+unsafe.Sizeof(caretStop{}))
+	}
+	return n
+}
+
+func (s *System) unlinkLayout(c *cached) {
+	if c.prev != nil {
+		c.prev.next = c.next
+	} else {
+		s.oldest = c.next
+	}
+	if c.next != nil {
+		c.next.prev = c.prev
+	} else {
+		s.newest = c.prev
+	}
+	// Returned layouts may outlive the cache. Do not let them retain it.
+	c.prev, c.next = nil, nil
+}
+
+func (s *System) useLayout(c *cached) {
+	c.used = s.frame
+	if s.newest == c {
+		return
+	}
+	if c.prev != nil || c.next != nil || s.oldest == c {
+		s.unlinkLayout(c)
+	}
+	c.prev = s.newest
+	if s.newest != nil {
+		s.newest.next = c
+	} else {
+		s.oldest = c
+	}
+	s.newest = c
+}
+
+func (s *System) removeLayout(c *cached) {
+	s.unlinkLayout(c)
+	delete(s.layouts, c.layout.Params)
+	s.layoutBytes -= c.bytes
+}
+
+func (s *System) clearLayouts() {
+	for s.oldest != nil {
+		s.unlinkLayout(s.oldest)
+	}
+	clear(s.layouts)
+	s.layoutBytes = 0
+}
+
+// LayoutsMade returns how many layouts the system has made, those Layout
+// found in its cache left out.
+func (s *System) LayoutsMade() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.made
+}
+
+// Generation returns a number that changes whenever the system forgets
+// its layouts, as it lets go of its fonts (EndFrame) or takes other ones:
+// the layouts it returned before are then to be made anew, and those of
+// fonts it let go of must not be drawn.
+func (s *System) Generation() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.gen
+}
+
+// Shape lays out p.Text as Layout does, but caches nothing, for text that
+// its caller keeps or rarely draws twice. The result belongs to the
+// caller.
+func (s *System) Shape(p Params) *Layout {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return &s.layout(p).layout
 }
 
 // Metrics returns the ascent, descent and default line height of a style.
@@ -471,11 +687,15 @@ func metricsOf(f *Font, style Style) lineMetrics {
 	return m
 }
 
-func (s *System) layout(p Params) *Layout {
+func (s *System) layout(p Params) *cached {
+	s.made++
+	s.engine().resetScratch()
 	m := metricsOf(s.font(p.Style), p.Style)
 	runes := []rune(p.Text)
 	spans := decodeSpans(p.Spans)
-	l := &Layout{Params: p, Runes: runes}
+	c := &cached{layout: Layout{Params: p, Runes: runes}}
+	l := &c.layout
+	l.Lines = c.line[:0]
 	y := float32(0)
 	for start := 0; start <= len(runes); {
 		end := start
@@ -486,8 +706,8 @@ func (s *System) layout(p Params) *Layout {
 		if p.MaxLines > 0 {
 			maxLines = p.MaxLines - len(l.Lines)
 		}
-		lines, truncated := s.paragraph(p, spans, runes, start, end, maxLines, end < len(runes), m, &y)
-		l.Lines = append(l.Lines, lines...)
+		var truncated bool
+		l.Lines, truncated = s.paragraph(l.Lines, p, spans, runes, start, end, maxLines, end < len(runes), m, &y)
 		if truncated {
 			l.Truncated = true
 			break
@@ -528,14 +748,14 @@ func (s *System) layout(p Params) *Layout {
 			}
 		}
 	}
-	return l
+	return c
 }
 
 // paragraph lays out runes[start:end], a paragraph without newlines, in at
-// most maxLines lines (0 is unlimited) from *y down, and moves *y past it.
-// It reports whether it cut the text, which continues after the paragraph
-// when continues is set.
-func (s *System) paragraph(p Params, spans []Span, runes []rune, start, end, maxLines int, continues bool, m lineMetrics, y *float32) ([]Line, bool) {
+// most maxLines lines (0 is unlimited) from *y down, appends them to out,
+// and moves *y past it. It reports whether it cut the text, which
+// continues after the paragraph when continues is set.
+func (s *System) paragraph(out []Line, p Params, spans []Span, runes []rune, start, end, maxLines int, continues bool, m lineMetrics, y *float32) ([]Line, bool) {
 	text := runes[start:end]
 	// A carriage return before the newline is part of it.
 	if n := len(text); n > 0 && text[n-1] == '\r' {
@@ -560,10 +780,22 @@ func (s *System) paragraph(p Params, spans []Span, runes []rune, start, end, max
 		shaped = append(shaped[:maxLines-1], last)
 		truncated = true
 	}
-	lines := make([]Line, len(shaped))
-	for i, sl := range shaped {
-		lines[i] = line(p, text, sl, start, rtl, m, y)
+	// The glyphs of the lines share one allocation.
+	n := 0
+	for _, sl := range shaped {
+		n += glyphCount(sl)
 	}
+	var room []Glyph
+	if n > 0 {
+		room = make([]Glyph, n)
+	}
+	first := len(out)
+	for _, sl := range shaped {
+		k := glyphCount(sl)
+		out = append(out, line(p, text, sl, start, rtl, m, y, room[:0:k], &s.starts))
+		room = room[k:]
+	}
+	lines := out[first:]
 	// Runes between lines, if an engine left any out, belong to the line
 	// before.
 	for i := 0; i < len(lines)-1; i++ {
@@ -572,13 +804,26 @@ func (s *System) paragraph(p Params, spans []Span, runes []rune, start, end, max
 	if !truncated {
 		lines[len(lines)-1].End = end
 	}
-	return lines, truncated
+	return out, truncated
+}
+
+// glyphCount returns how many glyphs a shaped line has.
+func glyphCount(sl shapedLine) int {
+	n := 0
+	for _, run := range sl.runs {
+		n += len(run.glyphs)
+	}
+	return n
 }
 
 // line positions a line of the paragraph text, which starts at rune
-// offset of the layout, with its top at *y, and moves *y past it.
-func line(p Params, text []rune, sl shapedLine, offset int, rtl bool, m lineMetrics, y *float32) Line {
+// offset of the layout, with its top at *y, and moves *y past it. Its
+// glyphs go to room, which has room for those of sl; buf is a buffer.
+func line(p Params, text []rune, sl shapedLine, offset int, rtl bool, m lineMetrics, y *float32, room []Glyph, buf *[]int) Line {
 	line := Line{Start: offset + sl.start, End: offset + sl.end, RTL: rtl, Ascent: m.ascent, Descent: m.descent}
+	if cap(room) > 0 {
+		line.Glyphs = room
+	}
 	// Whitespace ending a line takes no room, unless kept.
 	trim := sl.end
 	if !p.KeepSpaces {
@@ -587,8 +832,8 @@ func line(p Params, text []rune, sl shapedLine, offset int, rtl bool, m lineMetr
 		}
 	}
 	size := p.Style.FontSize()
-	x0, x1 := float32(math.MaxFloat32), float32(-math.MaxFloat32)
-	var starts []int
+	x0 := float32(math.MaxFloat32)
+	starts := *buf
 	for _, run := range sl.runs {
 		runSize := size
 		if f := run.font; f != nil {
@@ -622,14 +867,18 @@ func line(p Params, text []rune, sl shapedLine, offset int, rtl bool, m lineMetr
 				g.Cluster += offset
 			}
 			g.Size = runSize
-			x0, x1 = min(x0, g.X), max(x1, g.X+g.Advance)
+			x0 = min(x0, g.X)
+			// Logical width follows the pen, not the glyphs' drawing
+			// offsets. Pango may kern "11" by offsetting its second glyph
+			// while keeping whole-pixel advances for line breaking.
+			line.Width += g.Advance
 			line.Glyphs = append(line.Glyphs, g)
 		}
 	}
 	if len(line.Glyphs) == 0 {
-		x0, x1 = 0, 0
+		x0 = 0
 	}
-	line.Width = x1 - x0
+	line.Width = max(line.Width, 0)
 	line.Height = max(m.lineHeight, line.Ascent+line.Descent)
 	line.Y = *y
 	line.Baseline = *y + (line.Height-line.Ascent-line.Descent)/2 + line.Ascent
@@ -638,8 +887,12 @@ func line(p Params, text []rune, sl shapedLine, offset int, rtl bool, m lineMetr
 		line.Glyphs[i].Y += line.Baseline
 	}
 	*y += line.Height
+	*buf = starts
 	return line
 }
+
+// ellipsis ends text cut short, unless Params.Ellipsis gives another.
+var ellipsis = []rune{'…'}
 
 // ellipsize lays out the paragraph text from rune start on one line ending
 // with an ellipsis: as many of its graphemes as fit the width with it.
@@ -647,18 +900,27 @@ func (s *System) ellipsize(text []rune, spans []Span, start int, p Params, rtl b
 	e := s.engine()
 	rest := text[start:]
 	restSpans := spansIn(spans, start, len(text))
-	mark := []rune(p.Ellipsis)
-	if p.Ellipsis == "" {
-		mark = []rune{'…'}
+	mark := ellipsis
+	if p.Ellipsis != "" {
+		mark = []rune(p.Ellipsis)
 	}
 	cut := len(rest)
 	if p.Width > 0 {
-		var ellipsis float32
-		for _, l := range e.shape(mark, p.Style, nil, 0, rtl, false) {
-			ellipsis = max(ellipsis, advance(l))
+		key := markKey{p.Style, p.Ellipsis, rtl}
+		ellipsis, ok := s.marks[key]
+		if !ok {
+			for _, l := range e.shape(mark, p.Style, nil, 0, rtl, false) {
+				ellipsis = max(ellipsis, advance(l))
+			}
+			if len(s.marks) >= 256 {
+				clear(s.marks)
+			}
+			s.marks[key] = ellipsis
 		}
 		// The advance of each cluster, at its first rune.
-		advances := make([]float32, len(rest))
+		s.advances = slices.Grow(s.advances[:0], len(rest))[:len(rest)]
+		advances := s.advances
+		clear(advances)
 		for _, l := range e.shape(rest, p.Style, restSpans, 0, rtl, false) {
 			for _, run := range l.runs {
 				for _, g := range run.glyphs {
@@ -688,9 +950,8 @@ func (s *System) ellipsize(text []rune, spans []Span, start int, p Params, rtl b
 	for cut > 0 && unicode.IsSpace(rest[cut-1]) {
 		cut--
 	}
-	t := make([]rune, cut+len(mark))
-	copy(t, rest[:cut])
-	copy(t[cut:], mark)
+	t := append(append(s.ellipsized[:0], rest[:cut]...), mark...)
+	s.ellipsized = t
 	out := shapedLine{start: start, end: start + cut}
 	// The ellipsis takes the style of the text it ends.
 	tSpans := spansIn(restSpans, 0, cut)
@@ -715,13 +976,13 @@ func (s *System) ellipsize(text []rune, spans []Span, start int, p Params, rtl b
 
 // advance returns the width a shaped line's glyphs take.
 func advance(l shapedLine) float32 {
-	x0, x1 := float32(math.MaxFloat32), float32(-math.MaxFloat32)
+	var width float32
 	for _, run := range l.runs {
 		for _, g := range run.glyphs {
-			x0, x1 = min(x0, g.X), max(x1, g.X+g.Advance)
+			width += g.Advance
 		}
 	}
-	return max(x1-x0, 0)
+	return max(width, 0)
 }
 
 // isRTL reports whether a paragraph is right-to-left: whether its first

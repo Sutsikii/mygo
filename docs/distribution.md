@@ -37,10 +37,15 @@ platform, and are skipped with a note elsewhere: macOS apps are signed and
 put in disk images on macOS only, and Windows installers are made on other
 systems only where [NSIS](#the-installer) is installed.
 
+The CLI defaults to `CGO_ENABLED=0`. If an app's dependencies need cgo,
+set `CGO_ENABLED=1` in the environment for `mygo dev`, `mygo build` and
+`mygo generate`. Those builds need a C compiler for the target platform;
+when cross-compiling, set `CC` to a suitable cross compiler.
+
 | Platform | In `build/<os>-<arch>/` |
 |---|---|
-| macOS | `My App.app`, signed, and `My App 0.1.0.dmg` |
-| Windows | `My App.exe`, the files of the app, and the installer `My App Setup 0.1.0.exe` |
+| macOS | `My App.app`, signed, and `My App 0.1.0 arm64.dmg` (`My App 0.1.0.dmg` for `darwin/universal`) |
+| Windows | `My App.exe`, the files of the app, and the installer `My App Setup 0.1.0 amd64.exe` |
 | Linux | `my-app`, `my-app.desktop`, `my-app.png`, `my-app.xml` for the file types the app defines, the files of the app, their archive `my-app-0.1.0-linux-amd64.tar.gz` with [`install.sh`](#the-install-script), and the Debian package `my-app_0.1.0_amd64.deb` |
 
 Other flags: `-debug` keeps development features such as the inspector,
@@ -71,6 +76,35 @@ export default defineConfig({
 The icon is `resources/icon.png`, or the `icon` of the configuration: a square PNG,
 ideally 1024×1024. `mygo build` makes it the `.icns` of macOS, the icon
 resource of the Windows executable and the icon of the Linux desktop entry.
+
+On macOS, `macos.icon` adds an asset catalog, which macOS prefers to the
+`.icns`: an `Assets.car` compiled with `actool`, whose app icon is named
+`AppIcon` (or what `macos.infoPlist` sets as `CFBundleIconName`), or an
+Icon Composer `.icon`, the layered icon of macOS 26, which `mygo build`
+compiles with `actool` from Xcode 26 or later, with the `.icns` that
+`actool` renders from it in place of the PNG's. Building elsewhere, or when
+the compilation fails, skips the `.icon` with a message, and the app keeps
+the PNG's `.icns`. `mygo dev` shows the `.icns`.
+
+```ts
+export default defineConfig({
+  macos: { icon: "AppIcon.icon" }, // outside resources, which ship as they are
+});
+```
+
+For builds without Xcode, such as CI on Linux, commit the `Assets.car`
+that `actool` compiles from the `.icon` and make it `macos.icon`. The
+`.icon` has to be named `AppIcon.icon`: `actool` names the icon after the
+file, and compiles nothing when `--app-icon` differs.
+
+```sh
+mkdir -p icon
+xcrun actool AppIcon.icon --compile icon --platform macosx --target-device mac \
+  --minimum-deployment-target 12.0 --app-icon AppIcon \
+  --output-partial-info-plist icon/partial.plist
+```
+
+This writes `icon/Assets.car`, for `macos: { icon: "icon/Assets.car" }`.
 
 ## Resources
 
@@ -191,6 +225,36 @@ export default defineConfig({
 </plist>
 ```
 
+### Native libraries of packages
+
+A Go package that loads a native library with purego, as the
+[terminal plugin](plugins/terminal.md) loads libghostty-vt, names its
+builds in a `mygo-plugin.json` next to its sources, with a file per
+platform, where to download it and its SHA-256:
+
+```json
+{
+  "libraries": [
+    {
+      "name": "libexample",
+      "files": {
+        "darwin-arm64": { "name": "libexample.dylib", "url": "https://…/libexample-darwin-arm64.dylib", "sha256": "…" },
+        "linux-amd64": { "name": "libexample.so", "url": "https://…/libexample-linux-amd64.so", "sha256": "…" },
+        "windows-amd64": { "name": "example.dll", "url": "https://…/example-windows-amd64.dll", "sha256": "…" }
+      }
+    }
+  ]
+}
+```
+
+`mygo build` and `mygo dev` find these files in the packages the app is
+built from, download each library once into the user's cache
+(`<cache>/mygo/natives/<sha256>/`), check its SHA-256, and install it at
+the top of the app's resources under its name, signed like the other
+code there; a universal macOS app gets both architectures in one file.
+The package loads it from `PathResources`. Building for a platform the
+package has no file for fails.
+
 ## macOS
 
 `mygo build` makes an app bundle, signs it, and puts it in a disk image
@@ -257,7 +321,9 @@ window. A `.syso` file of your own in the main package replaces them.
 
 ### The installer
 
-`mygo build` also makes `My App Setup 1.2.0.exe`. It installs the app for
+`mygo build` also makes `My App Setup 1.2.0 amd64.exe`, named for its
+architecture as the disk images are, so that the installers of two
+targets, uploaded to one release, keep both. It installs the app for
 the current user in `%LOCALAPPDATA%\Programs\My App`, which needs no
 administrator rights and lets the app [update itself](updates.md), adds a
 Start menu shortcut and an uninstaller listed in Settings, and registers

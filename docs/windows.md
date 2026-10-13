@@ -1,7 +1,7 @@
 # Windows
 
 A window is a native window that shows a web page, loaded from its `URL`,
-or [native UI](ui.md) that MyGo draws, from its `Content`. Create windows
+or [native UI](ui/README.md) that MyGo draws, from its `Content`. Create windows
 with `mygo.NewWindow` once the app is ready:
 
 ```go
@@ -40,25 +40,25 @@ on the screen. Sizes and positions are in device-independent pixels.
 |---|---|
 | `Title` | the window title; defaults to the app name, and a page's `<title>` replaces it |
 | `URL` | loaded once the window exists; `/` and other URLs without a scheme are pages of the [frontend](frontend.md#how-pages-load) |
-| `Content` | shows [native UI](ui.md) that MyGo draws, instead of a page |
+| `Content` | shows [native UI](ui/README.md) that MyGo draws, instead of a page |
 | `Width`, `Height` | the size of the window, or of what it shows with `UseContentSize` |
 | `X`, `Y` | the top-left corner; the window is centered when both are 0 |
 | `MinWidth`, `MinHeight`, `MaxWidth`, `MaxHeight` | limits of resizing; 0 means none |
 | `StateKey` | remembers the window's bounds and state under this key, see [below](#remember-where-windows-were) |
 | `Hidden` | creates the window without showing it |
 | `Maximized`, `FullScreen` | creates it maximized or in full screen |
-| `Frameless` | no title bar and borders: the page draws them, see [custom title bars](frontend.md#custom-title-bars), or the [native UI](ui.md#windows-with-native-ui) |
-| `TitleBarStyle` | hides the title bar but keeps the window buttons over the page, see [custom title bars](frontend.md#custom-title-bars), or over [native UI](ui.md#windows-with-native-ui) |
+| `Frameless` | no title bar and borders: the page draws them, see [custom title bars](frontend.md#custom-title-bars), or the [native UI](ui/windows.md) |
+| `TitleBarStyle` | hides the title bar but keeps the window buttons over the page, see [custom title bars](frontend.md#custom-title-bars), or over [native UI](ui/windows.md) |
 | `TrafficLightPosition` | moves the window buttons of a hidden title bar (macOS) |
 | `TitleBarHeight` | the height of the title bar the page draws under the window buttons (Linux, Windows) |
-| `Transparent`, `Vibrancy` | a transparent window, and the material behind a transparent page (macOS, Windows 11) or [native UI](ui.md#windows-with-native-ui) (macOS) |
+| `Transparent`, `Vibrancy` | a transparent window, and the material behind a transparent page or [native UI](ui/windows.md) (macOS, Windows 11 22H2). On Windows, a window with a material has no menu bar: Alt and F10 open its menus in a popup |
 | `BackgroundColor` | fills the window until the page paints, in CSS syntax such as `"#1e1e1e"`, or `"light-dark(#f5f5f7, #1e1e1e)"` to follow the appearance |
 | `Opacity` | between 0 and 1 |
 | `DisableResize`, `DisableMove`, `DisableMinimize`, `DisableMaximize`, `DisableClose`, `DisableFullScreen`, `DisableShadow` | take abilities away |
 | `AlwaysOnTop` | keeps the window above others |
 | `SkipTaskbar` | leaves the window out of the taskbar (Linux, Windows) |
 | `AutoHideMenuBar` | shows the menu bar only while the keyboard is in it, from Alt or F10 (Linux, Windows), see [the menu bar](menus.md#the-menu-bar) |
-| `Parent`, `Modal` | a child window, modal to its parent |
+| `Parent`, `Modal` | a child window, modal to its parent; for one placed next to a part of it, see [flyouts](#flyouts) |
 | `Page` | the options of the window's [page](#pages): its preload script, trusted origins, web inspector, zoom and user agent |
 
 ## Show windows without flashing
@@ -88,6 +88,41 @@ as long as it would show on a connected display. They override `X`, `Y`,
 stay the defaults of the first launch. Give each kind of window its own key:
 `"main"`, `"preferences"`.
 
+An app that keeps its data elsewhere, such as in its own database, keeps
+the states there with a `WindowStateStore`, set before the first window
+with a `StateKey`, and no `window-state.json` is written:
+
+```go
+type windowStates struct{ db *sql.DB }
+
+func (s windowStates) LoadWindowStates() (map[string]mygo.WindowState, error) {
+	var data []byte
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key = 'windows'`).Scan(&data)
+	if err != nil {
+		return nil, err
+	}
+	var states map[string]mygo.WindowState
+	return states, json.Unmarshal(data, &states)
+}
+
+func (s windowStates) SaveWindowStates(states map[string]mygo.WindowState) error {
+	data, err := json.Marshal(states)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT OR REPLACE INTO settings (key, value) VALUES ('windows', ?)`, data)
+	return err
+}
+
+mygo.App.SetWindowStateStore(windowStates{db})
+```
+
+MyGo loads the states once, when the first window with a `StateKey` is
+created, and saves them all when such a window closes and when the app
+quits, on the main thread. Windows open with their options when there are
+no states or loading them fails; a save that fails is tried again the next
+time.
+
 ## Size, position and state
 
 ```go
@@ -106,15 +141,20 @@ win.Focus()             // Blur, IsFocused
 
 `Bounds`, `ContentBounds`, `Size`, `ContentSize` and `Position` read them
 back; [`mygo.Screen`](native.md#displays) tells where the displays are.
-On Linux under Wayland the compositor decides where windows go and
-ignores the positions apps set.
+`Bounds` are the whole window's, title bar and borders included (on Linux
+X11, the window manager's frame), and `ContentBounds` those of the area the
+page or native UI shows in, below a menu bar. On Linux under Wayland the
+compositor decides where windows go and ignores the positions apps set,
+and its decorations are not part of `Bounds`.
 
 Other properties:
 
 - `SetTitle`, `SetResizable`, `SetMovable`, `SetMinimizable`,
   `SetMaximizable`, `SetClosable`, `SetMinimumSize`, `SetMaximumSize`,
   `SetAlwaysOnTop`, `SetOpacity`, `SetHasShadow`, `SetBackgroundColor` and
-  `SetVibrancy` change what the options set.
+  `SetVibrancy` change what the options set. On Windows, `SetVibrancy`
+  changes the material of a window created with one, and shows none in
+  other windows.
 - `SetIcon(png)` gives the window its own icon in its title bar and taskbar
   button (Linux, Windows).
 - `SetSkipTaskbar` hides the window from the taskbar (Linux, Windows).
@@ -154,6 +194,134 @@ prefs := mygo.NewWindow(mygo.WindowOptions{
 })
 ```
 
+## Flyouts
+
+A flyout is a window without a frame, a background or a taskbar button,
+owned by its parent and placed next to a rectangle of it, its anchor: the
+list of a combo box, a hover card, a popover with a form. Unlike an
+[overlay](ui/overlays.md) of native UI or a popover of the page, it may
+extend beyond the parent's edges, and the work area of the display decides
+where it goes, not the parent's content. Its page or [native UI](ui/README.md)
+draws all of it, its background included:
+
+```go
+fl := mygo.NewFlyout(mygo.FlyoutOptions{
+	Parent:    win,
+	Anchor:    mygo.Rectangle{X: 20, Y: 40, Width: 120, Height: 28}, // in win's content area
+	Placement: mygo.PlacementBottomStart,
+	Gap:       4,
+	Width:     240,
+	Height:    300,
+	Content:   ui.View(app.suggestions),
+})
+```
+
+The anchor is in DIPs relative to the parent's content area, which is
+what `ui.Element.Bounds` gives for the element that opens the flyout; a
+rectangle of zero size anchors it to a point. `Placement` names the side
+of the anchor the flyout goes to and how it lines up with it along that
+side, as `"bottom-start"`, `"right"` or `"top-end"`. Where the work area
+has no room for it there, the flyout flips to the other side, or the other
+end, if that has room, then slides back into the work area, then shrinks
+to fit it, as GTK places menus and Wayland compositors place popups. It
+stays above its parent, follows it as it moves and closes with it.
+`SetAnchor` places it against another rectangle, and `SetSize` resizes it
+where it goes; `IsFlyout` tells a flyout from other windows.
+
+With `Focusable`, a flyout takes the keyboard as it shows and closes as a
+menu does when the user presses outside it, another window takes the
+keyboard or the app is deactivated. `OnClose` listeners hear it and may
+keep it open, except on Wayland, whose compositor dismisses it. On Linux
+and Windows the press only closes the flyout, as it closes their menus;
+on macOS it goes on to what is under the pointer, but on the anchor, as
+AppKit's popovers. So a click on the button that opened it closes it, and
+does not open it again. Menus, lists to choose from and popovers are
+focusable, and handle their own keys: the arrows, Enter.
+
+Without it, a flyout never takes the keyboard, which stays in the parent,
+and it stays until it is closed: a tooltip, a hover card, or the
+suggestions of a text field in the parent, whose view drives them and
+closes them as it sees fit, as when the field loses the keyboard. (On
+Wayland, only a popup that takes the keyboard hears of presses outside
+it.)
+
+Either closes, as the user closing it, on an Escape its content leaves:
+one no element or shortcut of native UI takes, or no handler of the page
+cancels with `preventDefault()`, as the web's popovers.
+
+`Shadow` gives it the system's window shadow on macOS, where it follows
+the shape of what the flyout draws and outlines it with a hairline (so
+draw no border of your own there), and on Windows, where Windows 11 rounds
+the flyout's corners as it rounds its menus and outlines it (so draw
+neither a border nor rounded corners there).
+
+On macOS, `Popover` gives it the look of the system's popovers instead: it
+shows in an `NSPopover`, which draws its material, rounded corners and an
+arrow pointing at the middle of the anchor, and animates. AppKit places it
+on the side `Placement` names, or the opposite one; the rest of the
+placement, and `Gap`, do not apply. As AppKit's popovers do, it has the
+keyboard while it shows, and with `Focusable` it closes as the user clicks
+elsewhere. Its content draws no background over the material: in native
+UI, `c.Vibrancy()` reports it, so a view draws its own panel elsewhere:
+
+```go
+func (app *App) about(c *ui.Context) {
+	c.Root().Background(ui.Transparent)
+	box := ui.Column(c).Fill() // over the popover's material
+	if !c.Vibrancy() {
+		box = ui.Column(c).Fill().Background(c.Theme().Surface).Radius(10)
+	}
+	box.Padding(12).Children(func() { ui.Text(c, "MyGo") })
+}
+```
+
+A flyout can hang from a tray icon instead of a window, as the panel of
+a menu bar app: give it the `Tray` in place of a `Parent`. It goes next to
+the icon, on the side `Placement` names, and floats over the windows of
+other apps. Below the macOS menu bar, `PlacementBottom` centers it under
+the icon (with `Popover`, the arrow of the system's popover points at
+it); on Windows, the same placement flips above an icon of a taskbar at
+the bottom of the screen. A press on the icon does not dismiss a
+focusable flyout, so the icon's click can toggle it. Keep the app running
+as the flyout, its only window, closes:
+
+```go
+mygo.App.OnWindowAllClosed(func() {})
+tray.OnClick(func() {
+	if panel != nil {
+		panel.Close()
+		return
+	}
+	panel = mygo.NewFlyout(mygo.FlyoutOptions{
+		Tray:      tray,
+		Placement: mygo.PlacementBottom,
+		Width:     280,
+		Height:    230,
+		Focusable: true,
+		Popover:   true,
+		Content:   ui.View(app.panel),
+	})
+	panel.OnClosed(func() { panel = nil })
+})
+```
+
+Linux's tray icons tell neither clicks nor where they are: open the flyout
+from a menu item of the icon there, and it shows in the middle of the
+primary display's work area. `examples/menubar-flyout` is such an app.
+
+How each platform shows them:
+
+| | macOS | Linux | Windows |
+|---|---|---|---|
+| window | a borderless, nonactivating `NSPanel`, a child window of its parent while it shows, or at the level of menus for a tray | a `GTK_WINDOW_POPUP`: override-redirect on X11, an `xdg_popup` of its parent on Wayland; for a tray, an undecorated utility window kept above | an owned `WS_POPUP`, `WS_EX_TOOLWINDOW`, without a redirection bitmap; topmost and unowned for a tray |
+| placement | in the screen's visible frame | in the monitor's work area on X11; the compositor's positioner (`gdk_window_move_to_rect`) on Wayland | in the monitor's work area (`MonitorFromRect`) |
+| keyboard | the key window when focusable; the parent stays the main window | a grab of the seat and the app's input when focusable, as GTK's menus | activated when focusable, else `WS_EX_NOACTIVATE` |
+
+On Wayland, a popup shows only over the topmost one: showing a flyout
+closes the others that show, but its own ancestors, as the user would.
+`examples/flyout` opens a list of colors, a note editor and an About box,
+a popover on macOS.
+
 ## Events
 
 Listeners run on the main thread: keep them short, and start goroutines for
@@ -168,8 +336,8 @@ slow work. Each `On…` method returns a function that removes the listener.
 | `OnResize`, `OnMove` | it was resized or moved |
 | `OnMaximize`, `OnUnmaximize`, `OnMinimize`, `OnRestore` | its state changed |
 | `OnEnterFullScreen`, `OnLeaveFullScreen` | it entered or left full screen |
-| `OnReadyToShow` | its first page is ready to be displayed (windows showing a web page) |
-| `OnFileDrop` | files were dropped on its page, see [dropped files](frontend.md#dropped-files), or on native UI that did not take them, see [input](ui.md#input) |
+| `OnReadyToShow` | its first page is ready to be displayed, or its native UI drew its first frame |
+| `OnFileDrop` | files were dropped on its page, see [dropped files](frontend.md#dropped-files), or on native UI that did not take them, see [dropped files](ui/input.md#dropped-files) |
 
 Ask before closing a window with unsaved changes:
 
@@ -204,7 +372,7 @@ win.OnClose(func(e *mygo.CloseEvent) {
 
 A window shows one page at a time and has a history, like a browser tab.
 `win.Page()` returns it, or nil for a window that shows
-[native UI](ui.md):
+[native UI](ui/README.md):
 
 ```go
 page := win.Page()
@@ -228,7 +396,7 @@ mygo.NewWindow(mygo.WindowOptions{
 |---|---|
 | `PreloadScript` | JavaScript run before every page's own scripts |
 | `TrustedOrigins` | other origins whose pages may call Go, see [who may call](bindings.md#who-may-call) |
-| `DevTools` | `DevToolsAuto` (the inspector in development builds), `DevToolsEnabled` or `DevToolsDisabled` |
+| `DevTools` | `DevToolsAuto` (the inspector in development builds), `DevToolsEnabled` or `DevToolsDisabled`; for a window of native UI, its [inspector](ui/inspector.md) |
 | `ZoomFactor`, `UserAgent` | the page's zoom (1 is 100%) and user agent |
 
 Page events, on `win.Page()`:
@@ -357,7 +525,8 @@ of a page control its inspector, when it has one, see
   the focused one and `mygo.WindowByID(id)` the one with an `ID()`, which
   pages know as `runtime().windowId`.
 - `mygo.CallerWindow(ctx)` returns the window whose page called a bound
-  method.
+  method, and `mygo.CallerPage(ctx)` the page: the window's, or that of a
+  web view in a window of native UI ([Web view](ui/web-view.md)).
 - `mygo.App.OnWindowCreated` is called for every new window.
 
 ## Native access

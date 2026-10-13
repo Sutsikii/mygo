@@ -39,3 +39,25 @@ func TestSurfaceGL(handle uintptr) (how string, pix []byte, width, height int) {
 	}
 	return how, pix, width, height
 }
+
+// TestSurfaceOnScreen returns, as a PNG, what the display shows of the
+// surface of a window: GTK repaints only what frames drawn in memory
+// changed, and keeps the rest.
+func TestSurfaceOnScreen(handle uintptr) []byte {
+	s := surfaceByHandle(handle)
+	var getFromWindow func(win ptr, x, y, width, height int32) ptr
+	if s == nil || !bind(libGDK, &getFromWindow, "gdk_pixbuf_get_from_window") {
+		return nil
+	}
+	// The area's GdkWindow is its parent's when it has none of its own.
+	var at gdkRectangle
+	if !gtkWidgetGetHasWindow(s.area) {
+		gtkWidgetGetAllocation(s.area, &at)
+	}
+	pix := getFromWindow(gtkWidgetGetWindow(s.area), at.X, at.Y, gtkWidgetGetAllocatedWidth(s.area), gtkWidgetGetAllocatedHeight(s.area))
+	if pix == 0 {
+		return nil
+	}
+	defer gObjectUnref(pix)
+	return pngFromPixbuf(pix)
+}

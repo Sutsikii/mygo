@@ -4,7 +4,7 @@ Windows that show web pages show the pages of the app's frontend: HTML,
 CSS and JavaScript built with any tools. New projects use TypeScript and
 [Vite](https://vite.dev), but MyGo only needs a URL to load, during
 development, and a directory of built files, for builds. Windows of
-[native UI](ui.md) need no frontend, and an app that only has those has
+[native UI](ui/README.md) need no frontend, and an app that only has those has
 none.
 
 ## How pages load
@@ -50,7 +50,8 @@ Keep data you care about in Go, for example in a file in
 Windows can also load other content into their page:
 
 - `win.Page().LoadURL("https://example.com")`, a web page;
-- `win.Page().LoadHTML(html, baseURL)`, an HTML string;
+- `win.Page().LoadHTML(html, baseURL)`, an HTML string, which reloads load
+  again;
 - `win.Page().LoadFile("docs/index.html")`, a local file, resolved against the
   working directory, then the executable's directory (and the Resources
   directory of a macOS app).
@@ -231,7 +232,7 @@ and, marked with `--app-region: drag`, moves the window:
 
 `Transparent: true` lets a page with a transparent background show the
 desktop through, and `Vibrancy` puts a blurred material behind it on macOS
-and Windows 11:
+and Windows 11 22H2 and later:
 
 ```go
 mygo.NewWindow(mygo.WindowOptions{
@@ -242,8 +243,9 @@ mygo.NewWindow(mygo.WindowOptions{
 })
 ```
 
-See `examples/frameless` for a complete custom title bar, and
-`examples/vibrancy` for a translucent sidebar under an inset title bar.
+See `examples/frameless` for a complete custom title bar. Native UI shows
+materials the same way ([Vibrancy](ui/windows.md#vibrancy)), as
+`examples/vibrancy` does in a translucent sidebar under an inset title bar.
 
 ## Dropped files
 

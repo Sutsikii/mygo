@@ -7,11 +7,11 @@ import (
 
 func TestRichText(t *testing.T) {
 	red, blue := RGB(255, 0, 0), RGB(0, 0, 255)
-	tt := NewTester(func(c *Context) {
-		Column(c).Padding(10).Gap(10).AlignItems(Start).Children(func() {
-			RichText(c, Span{Text: "plain "}, Span{Text: "RED", Color: red, Size: 30, Weight: 700}).Label("rich")
-			RichText(c, Span{Text: "under", Underline: true, Color: blue}, Span{Text: " over"}).Label("lined")
-			Text(c, "plain RED").Label("text")
+	tt := coreNewTester(func(c *context) {
+		coreColumn(c).Padding(10).Gap(10).AlignItems(Start).Children(func() {
+			coreRichText(c, Span{Text: "plain "}, Span{Text: "RED", Color: red, Size: 30, Weight: 700}).Label("rich")
+			coreRichText(c, Span{Text: "under", Underline: true, Color: blue}, Span{Text: " over"}).Label("lined")
+			coreText(c, "plain RED").Label("text")
 		})
 	}, 400, 200)
 	rich, _ := tt.Find("rich")
@@ -47,5 +47,21 @@ func TestRichText(t *testing.T) {
 	_, widest := count(lined, isBlue)
 	if float32(widest) < lined.W*0.4 || float32(widest) > lined.W*0.8 {
 		t.Errorf("the widest row of blue is %d pixels of %v", widest, lined.W)
+	}
+}
+
+// TestMeasureTextAgain checks that measuring spans measured before
+// allocates nothing, and that other spans measure anew.
+func TestMeasureTextAgain(t *testing.T) {
+	tt := coreNewTester(func(c *context) {}, 100, 100)
+	c := &tt.rt.c
+	short, _ := c.MeasureText(0, Span{Text: "000"})
+	long, _ := c.MeasureText(0, Span{Text: "000000"})
+	bold, _ := c.MeasureText(0, Span{Text: "000", Weight: 800, Size: 30})
+	if again, _ := c.MeasureText(0, Span{Text: "000"}); again != short || long <= short || bold <= short {
+		t.Errorf("widths %v, %v, %v, then %v", short, long, bold, again)
+	}
+	if n := testing.AllocsPerRun(20, func() { c.MeasureText(0, Span{Text: "000"}, Span{Text: "1", Weight: 700}) }); n != 0 {
+		t.Errorf("measuring the same spans allocates %v times", n)
 	}
 }

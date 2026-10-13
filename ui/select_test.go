@@ -7,10 +7,10 @@ import (
 
 func TestSelectableText(t *testing.T) {
 	const sentence = "Order 12345 shipped"
-	tt := NewTester(func(c *Context) {
-		Column(c).Padding(20).Gap(10).AlignItems(Start).Children(func() {
-			Text(c, sentence).Selectable()
-			Text(c, "Plain text")
+	tt := coreNewTester(func(c *context) {
+		coreColumn(c).Padding(20).Gap(10).AlignItems(Start).Children(func() {
+			coreText(c, sentence).Selectable()
+			coreText(c, "Plain text")
 		})
 	}, 400, 200)
 	var ed *editor
@@ -57,8 +57,8 @@ func TestSelectableText(t *testing.T) {
 	tt.Key(0, KeyBackspace)
 	tt.SetClipboard("pasted")
 	tt.Key(Cmd, KeyV)
-	if !tt.HasText(sentence) || string(ed.text) != sentence {
-		t.Errorf("typing changed the text to %q", string(ed.text))
+	if !tt.HasText(sentence) || ed.buf.s != sentence {
+		t.Errorf("typing changed the text to %q", ed.buf.s)
 	}
 	if tt.Move(x, y); tt.Cursor() != CursorText {
 		t.Errorf("the pointer is %v over selectable text", tt.Cursor())

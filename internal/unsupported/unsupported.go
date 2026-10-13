@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo/internal/platform"
+	"github.com/egoist/mygo/transfer"
 )
 
 // Backend reports that the platform is not supported.
@@ -43,8 +44,13 @@ func (*Backend) NewTray(platform.TrayHandler) (platform.Tray, error)        { re
 func (*Backend) RegisterHotkey(int, string) error                           { return errUnsupported }
 func (*Backend) UnregisterHotkey(int)                                       {}
 func (*Backend) NotificationsSupported() bool                               { return false }
-func (*Backend) ShowNotification(*platform.Notification) error              { return errUnsupported }
 func (*Backend) RemoveNotification(string)                                  {}
+
+func (*Backend) ShowNotification(_ *platform.Notification, done func(error)) {
+	done(errUnsupported)
+}
+
+func (*Backend) RemoveAllNotifications() {}
 
 type app struct{}
 
@@ -84,6 +90,14 @@ func (dialogs) ShowMessageBox(_ platform.Window, _ *platform.MessageBoxOptions, 
 
 type clipboard struct{}
 
+func (clipboard) ReadData([]transfer.Format) (transfer.Data, error) {
+	return transfer.Data{}, errUnsupported
+}
+func (clipboard) WriteData(transfer.Data, func()) error { return errUnsupported }
+func (clipboard) Formats() []transfer.Format            { return nil }
+func (clipboard) Flush() error                          { return errUnsupported }
+func (clipboard) Close()                                {}
+
 func (clipboard) ReadText() string           { return "" }
 func (clipboard) WriteText(string)           {}
 func (clipboard) ReadHTML() string           { return "" }
@@ -111,6 +125,10 @@ type theme struct{}
 func (theme) IsDark() bool     { return false }
 func (theme) SetSource(string) {}
 func (theme) UIFont() string   { return "" }
+
+func (theme) FontRendering() platform.FontRendering { return platform.FontRendering{} }
+
+func (theme) Preferences() platform.Preferences { return platform.Preferences{} }
 
 type power struct{}
 

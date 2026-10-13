@@ -1,14 +1,16 @@
 package mygo
 
 import (
+	"bytes"
 	"errors"
+	"image/png"
 	"math"
 	"runtime"
-	"strconv"
 	"sync"
 
 	"github.com/egoist/mygo/internal/accelerator"
 	"github.com/egoist/mygo/internal/platform"
+	"github.com/egoist/mygo/transfer"
 )
 
 var errLoopStopped = errors.New("mygo: the event loop has stopped")
@@ -59,50 +61,57 @@ var Clipboard ClipboardModule
 // ReadText returns the plain text on the clipboard.
 func (ClipboardModule) ReadText() string {
 	needsApp("Clipboard.ReadText")
-	return onMainValue(func() string { return backend().Clipboard().ReadText() })
+	return clipboardNativeValue(func() string { return backend().Clipboard().ReadText() })
 }
 
 // WriteText puts plain text on the clipboard.
-func (ClipboardModule) WriteText(text string) {
+func (c ClipboardModule) WriteText(text string) {
 	needsApp("Clipboard.WriteText")
-	onMain(func() { backend().Clipboard().WriteText(text) })
+	_ = c.Write(transfer.TextData(text))
 }
 
 // ReadHTML returns the HTML on the clipboard.
 func (ClipboardModule) ReadHTML() string {
 	needsApp("Clipboard.ReadHTML")
-	return onMainValue(func() string { return backend().Clipboard().ReadHTML() })
+	return clipboardNativeValue(func() string { return backend().Clipboard().ReadHTML() })
 }
 
 // WriteHTML puts HTML on the clipboard.
-func (ClipboardModule) WriteHTML(markup string) {
+func (c ClipboardModule) WriteHTML(markup string) {
 	needsApp("Clipboard.WriteHTML")
-	onMain(func() { backend().Clipboard().WriteHTML(markup) })
+	_ = c.Write(transfer.New(transfer.NewItem(transfer.Bytes(transfer.HTML, []byte(markup)), transfer.Bytes(transfer.Text, []byte(markup)))))
 }
 
 // ReadImage returns the image on the clipboard as PNG, or nil.
 func (ClipboardModule) ReadImage() []byte {
 	needsApp("Clipboard.ReadImage")
-	return onMainValue(func() []byte { return backend().Clipboard().ReadImage() })
+	return clipboardNativeValue(func() []byte { return backend().Clipboard().ReadImage() })
 }
 
 // WriteImage puts a PNG image on the clipboard.
-func (ClipboardModule) WriteImage(png []byte) error {
+func (c ClipboardModule) WriteImage(data []byte) error {
 	needsApp("Clipboard.WriteImage")
-	return onMainValue(func() error { return backend().Clipboard().WriteImage(png) })
+	if _, err := png.Decode(bytes.NewReader(data)); err != nil {
+		return err
+	}
+	return c.Write(transfer.New(transfer.NewItem(transfer.Bytes(transfer.PNG, data))))
 }
 
 // Clear empties the clipboard.
 func (ClipboardModule) Clear() {
 	needsApp("Clipboard.Clear")
-	onMain(func() { backend().Clipboard().Clear() })
+	onMain(func() {
+		if !clipboardProviding && !clipboardStopped {
+			withClipboardOperation(func() { backend().Clipboard().Clear() })
+		}
+	})
 }
 
 // AvailableFormats lists the formats (MIME types or platform types) on the
 // clipboard.
 func (ClipboardModule) AvailableFormats() []string {
 	needsApp("Clipboard.AvailableFormats")
-	return onMainValue(func() []string { return backend().Clipboard().AvailableFormats() })
+	return clipboardNativeValue(func() []string { return backend().Clipboard().AvailableFormats() })
 }
 
 // Display describes a monitor.
@@ -514,11 +523,20 @@ func (t *Tray) OnRightClick(fn func()) (off func()) { return t.onRight.add(fn, f
 
 // NotificationOptions configures a desktop notification.
 type NotificationOptions struct {
+	// ID identifies the notification: App.OnNotificationClick receives
+	// it, also after the app has quit and been launched again, and showing
+	// a notification with the ID of one still shown replaces that one.
+	// Empty gives it an ID of its own.
+	ID       string
 	Title    string
 	Subtitle string
 	Body     string
 	// Silent suppresses the notification sound.
 	Silent bool
+	// Group gathers the notifications that share it in one stack of
+	// Notification Center (macOS), such as the messages of a conversation.
+	// Empty leaves them in the app's.
+	Group string
 }
 
 // Notification is a desktop notification.
@@ -530,7 +548,6 @@ type Notification struct {
 
 var notifications struct {
 	sync.Mutex
-	next int
 	byID map[string]*Notification
 }
 
@@ -544,31 +561,54 @@ func NotificationsSupported() bool {
 
 // NewNotification creates a notification; call Show to display it.
 func NewNotification(opts NotificationOptions) *Notification {
-	notifications.Lock()
-	notifications.next++
-	n := &Notification{id: "mygo-" + strconv.Itoa(notifications.next), opts: opts}
-	notifications.Unlock()
-	return n
+	id := opts.ID
+	if id == "" {
+		// Unique across runs too, as notifications outlive them.
+		id = "mygo-" + randomText()
+	}
+	return &Notification{id: id, opts: opts}
 }
 
-// Show displays the notification.
+// ID returns the notification's ID: NotificationOptions.ID, or the one it
+// was given.
+func (n *Notification) ID() string { return n.id }
+
+// ErrNotificationsDenied is returned by Notification.Show when the user has
+// not allowed the app to show notifications (macOS).
+var ErrNotificationsDenied = platform.ErrNotificationsDenied
+
+// Show displays the notification, and returns once the system has it. On
+// macOS the first notification asks the user whether to allow them, and
+// Show waits for the answer; it returns ErrNotificationsDenied when they
+// are not allowed.
 func (n *Notification) Show() error {
 	needsApp("Notification.Show")
 	notifications.Lock()
 	if notifications.byID == nil {
 		notifications.byID = map[string]*Notification{}
 	}
+	_, shown := notifications.byID[n.id]
 	notifications.byID[n.id] = n
 	notifications.Unlock()
-	return onMainValue(func() error {
-		return backend().ShowNotification(&platform.Notification{
+	ch := make(chan error, 1)
+	onMain(func() {
+		backend().ShowNotification(&platform.Notification{
 			ID:       n.id,
 			Title:    n.opts.Title,
 			Subtitle: n.opts.Subtitle,
 			Body:     n.opts.Body,
 			Silent:   n.opts.Silent,
-		})
+			Group:    n.opts.Group,
+		}, func(err error) { deliver(ch, err) })
 	})
+	err := await(ch)
+	if err != nil && !shown {
+		// Nothing will be clicked.
+		notifications.Lock()
+		delete(notifications.byID, n.id)
+		notifications.Unlock()
+	}
+	return err
 }
 
 // Close removes the notification.
@@ -577,6 +617,19 @@ func (n *Notification) Close() {
 	delete(notifications.byID, n.id)
 	notifications.Unlock()
 	onMain(func() { backend().RemoveNotification(n.id) })
+}
+
+// ClearNotifications removes the app's notifications, on macOS those of
+// earlier runs left in Notification Center too. An app calls it as it
+// comes to the front, so that what the user has seen in the app does not
+// wait there:
+//
+//	mygo.App.OnDidBecomeActive(func() { mygo.ClearNotifications() })
+func ClearNotifications() {
+	notifications.Lock()
+	clear(notifications.byID)
+	notifications.Unlock()
+	onMain(func() { backend().RemoveAllNotifications() })
 }
 
 // OnClick is called when the user clicks the notification.
@@ -589,4 +642,5 @@ func notificationClicked(id string) {
 	if n != nil {
 		fire(&n.onClick)
 	}
+	fire1(&App.onNotificationClick, id)
 }

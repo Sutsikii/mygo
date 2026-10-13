@@ -2,6 +2,7 @@ package ui
 
 import (
 	"math"
+	"slices"
 
 	"github.com/egoist/mygo/internal/text"
 )
@@ -15,28 +16,28 @@ var inf = float32(math.Inf(1))
 
 func finite(v float32) bool { return v < inf }
 
-func (e *Element) padX() float32 { return e.pad[1] + e.pad[3] + e.border[1] + e.border[3] }
-func (e *Element) padY() float32 { return e.pad[0] + e.pad[2] + e.border[0] + e.border[2] }
+func (e *node) padX() float32 { return e.pad[1] + e.pad[3] + e.border[1] + e.border[3] }
+func (e *node) padY() float32 { return e.pad[0] + e.pad[2] + e.border[0] + e.border[2] }
 
 // contentX and contentY place the content box in the border box.
-func (e *Element) contentX() float32 { return e.pad[3] + e.border[3] }
-func (e *Element) contentY() float32 { return e.pad[0] + e.border[0] }
+func (e *node) contentX() float32 { return e.pad[3] + e.border[3] }
+func (e *node) contentY() float32 { return e.pad[0] + e.border[0] }
 
 // m returns margin i, with automatic margins as 0.
-func (e *Element) m(i int) float32 {
+func (e *node) m(i int) float32 {
 	if isAuto(e.margin[i]) {
 		return 0
 	}
 	return e.margin[i]
 }
 
-func (e *Element) marginX() float32 { return e.m(1) + e.m(3) }
-func (e *Element) marginY() float32 { return e.m(0) + e.m(2) }
+func (e *node) marginX() float32 { return e.m(1) + e.m(3) }
+func (e *node) marginY() float32 { return e.m(0) + e.m(2) }
 
-func (e *Element) scrolls() bool { return e.flags&(flagScrollX|flagScrollY) != 0 }
+func (e *node) scrolls() bool { return e.flags&(flagScrollX|flagScrollY) != 0 }
 
 // clampW and clampH apply the min and max sizes.
-func (e *Element) clampW(w, cbW float32) float32 {
+func (e *node) clampW(w, cbW float32) float32 {
 	if v, ok := e.maxW.resolve(base(cbW)); ok {
 		w = min(w, v)
 	}
@@ -46,7 +47,7 @@ func (e *Element) clampW(w, cbW float32) float32 {
 	return max(w, 0)
 }
 
-func (e *Element) clampH(h, cbH float32) float32 {
+func (e *node) clampH(h, cbH float32) float32 {
 	if v, ok := e.maxH.resolve(base(cbH)); ok {
 		h = min(h, v)
 	}
@@ -66,21 +67,66 @@ func base(v float32) float32 {
 
 // layoutTree lays the frame out in a window of w×h DIPs and gives every
 // element its box relative to the window.
-func layoutTree(root *Element, w, h float32) {
+func layoutTree(root *node, w, h float32) {
+	rt := root.c.rt
+	rt.consumed = false
 	layoutBox(root, w, h)
-	if rt := root.c.rt; len(rt.revealIDs) > 0 {
+	// Lists build rows as they lay out, which may ask to come into view.
+	for _, e := range root.c.reveal {
+		if !slices.Contains(rt.revealIDs, e.id) {
+			rt.revealIDs = append(rt.revealIDs, e.id)
+		}
+	}
+	if len(rt.revealIDs) > 0 {
 		revealAll(root, rt.revealIDs)
 		rt.revealIDs = rt.revealIDs[:0]
 	}
+	if rt.late {
+		// Rows built as their lists laid out handled their input as the
+		// view's elements do, and the next frame shows what that changed;
+		// what they put above the window is laid out with it.
+		rt.lateInput()
+		if ov := root.c.overlay; ov != nil {
+			if ov.parent == nil {
+				root.add(ov)
+			}
+			layoutAbsolute(root)
+		}
+	}
+	rt.animateLayout(root, w, h)
+	// Reattach overlays to the geometry shown by this frame, after transitions.
+	if ov := root.c.overlay; ov != nil {
+		layoutAbsolute(ov)
+	}
+	if rt.late {
+		// Lists resized by their transitions built rows as they laid out
+		// anew.
+		rt.lateInput()
+	}
 	place(root, 0, 0)
+	rt.animateMatches()
+}
+
+// lateInput forgets the input of the rows built as their lists laid out,
+// which they handled as the view's elements do: the next frame shows what
+// that changed.
+func (rt *engine) lateInput() {
+	rt.late = false
+	rt.forgetInput()
+	if rt.consumed {
+		rt.animating = true
+	}
 }
 
 // place turns the boxes, laid out relative to their parents, into window
 // coordinates, moving the content of scroll containers by their offset.
-func place(e *Element, x, y float32) {
+func place(e *node, x, y float32) {
 	e.x += x
 	e.y += y
 	cx, cy := e.x, e.y
+	if f := e.followX; f != nil {
+		cx -= float32(f.st.scrollX)
+	}
 	if e.scrolls() {
 		// The content may no longer reach as far as the offset, as when a
 		// page gives way to a shorter one, or the app asked for the end:
@@ -93,18 +139,19 @@ func place(e *Element, x, y float32) {
 			s.scrollTo(sx, sy)
 		}
 		if t := e.track; t != nil {
-			t.MaxX, t.MaxY = mx, my
+			t.MaxX, t.MaxY = float32(mx), float32(my)
 		}
 		if s.movedIn(e.c.rt.frame) {
 			// What was built read the old offset, as List's rows or the
 			// app from its ScrollState: build the next frame with the new.
 			e.c.rt.animating = true
 		}
-		cx -= s.scrollX
-		cy -= s.scrollY
+		cx -= float32(s.scrollX)
+		cy -= float32(s.scrollY - e.scrollBase)
 	}
 	for ch := e.first; ch != nil; ch = ch.next {
-		if ch.flags&flagAbsolute != 0 {
+		// A copy of an element leaving the flow stays where the flow was.
+		if ch.flags&flagAbsolute != 0 && ch.leaving != 1 {
 			place(ch, e.x, e.y)
 		} else {
 			place(ch, cx, cy)
@@ -114,7 +161,7 @@ func place(e *Element, x, y float32) {
 
 // relative returns how far the insets of an element in flow move it from
 // where the layout put it, against a content box cw×ch.
-func (e *Element) relative(cw, ch float32) (dx, dy float32) {
+func (e *node) relative(cw, ch float32) (dx, dy float32) {
 	if v, ok := e.inset[3].resolve(base(cw)); ok {
 		dx = v
 	} else if v, ok := e.inset[1].resolve(base(cw)); ok {
@@ -130,7 +177,7 @@ func (e *Element) relative(cw, ch float32) (dx, dy float32) {
 
 // textParams returns how to lay out the element's text at a content width
 // (0 for one line per paragraph).
-func (e *Element) textParams(width float32) text.Params {
+func (e *node) textParams(width float32) text.Params {
 	ts := e.resolvedText()
 	style := text.Style{
 		Family: ts.family, Size: ts.size, Weight: ts.weight, Italic: ts.italic, LineHeight: ts.lineHeight,
@@ -150,7 +197,7 @@ func (e *Element) textParams(width float32) text.Params {
 }
 
 // resolvedText merges the text styles of the element and its ancestors.
-func (e *Element) resolvedText() textStyle {
+func (e *node) resolvedText() textStyle {
 	var out textStyle
 	for p := e; p != nil && out.set != setAll; p = p.parent {
 		t := &p.ts
@@ -200,6 +247,9 @@ func (e *Element) resolvedText() textStyle {
 		if take&setBackground != 0 {
 			out.background = t.background
 		}
+		if take&setSelection != 0 {
+			out.selection = t.selection
+		}
 		out.set |= take
 	}
 	return out
@@ -207,7 +257,7 @@ func (e *Element) resolvedText() textStyle {
 
 // leafWidths returns the max-content and min-content widths of the
 // element's own content (text, image, input), without padding.
-func (e *Element) leafWidths() (maxW, minW float32) {
+func (e *node) leafWidths() (maxW, minW float32) {
 	switch e.kind {
 	case kindText:
 		if e.text == "" {
@@ -247,7 +297,13 @@ func (e *Element) leafWidths() (maxW, minW float32) {
 
 // intrinsic returns the element's max-content or min-content width, its
 // border box.
-func intrinsic(e *Element, maxContent bool) float32 {
+func intrinsic(e *node, maxContent bool) float32 {
+	if e.form != nil {
+		e.form.alignLabels()
+	}
+	if e.colFit != nil {
+		e.colFit.apply()
+	}
 	if v, ok := e.width.resolve(-1); ok {
 		return e.clampW(v, inf)
 	}
@@ -290,7 +346,7 @@ func intrinsic(e *Element, maxContent bool) float32 {
 
 // fitWidth returns the width of an element sized by its content within
 // avail DIPs, against a containing block cbW wide.
-func fitWidth(e *Element, avail, cbW float32) float32 {
+func fitWidth(e *node, avail, cbW float32) float32 {
 	if v, ok := e.width.resolve(base(cbW)); ok {
 		return e.clampW(v, cbW)
 	}
@@ -309,7 +365,7 @@ func fitWidth(e *Element, avail, cbW float32) float32 {
 
 // heightAt returns the height of the element when it is w wide, against
 // a containing block cbH high.
-func heightAt(e *Element, w, cbH float32) float32 {
+func heightAt(e *node, w, cbH float32) float32 {
 	if v, ok := e.height.resolve(base(cbH)); ok {
 		return e.clampH(v, cbH)
 	}
@@ -332,7 +388,7 @@ func heightAt(e *Element, w, cbH float32) float32 {
 
 // contentHeight returns the height the content takes in a content box cw
 // wide.
-func contentHeight(e *Element, cw float32) float32 {
+func contentHeight(e *node, cw float32) float32 {
 	switch e.kind {
 	case kindText:
 		return textSystem().Layout(e.textParams(max(cw, 1))).Height
@@ -342,7 +398,13 @@ func contentHeight(e *Element, cw float32) float32 {
 		}
 		return 0
 	case kindInput:
-		return e.inputHeight()
+		return e.inputHeight(cw)
+	}
+	if f := e.list; f != nil && f.n > 0 {
+		// A List is as high as all its rows, as far as the heights known
+		// tell, whichever it built.
+		s := f.s
+		return float32(s.heights.top(f.n, float64(max(e.gapY, 0))) - float64(max(e.gapY, 0)))
 	}
 	if e.first == nil {
 		return 0
@@ -352,7 +414,13 @@ func contentHeight(e *Element, cw float32) float32 {
 }
 
 // boxLayout lays out the children of a box, with flexbox or as a grid.
-func boxLayout(e *Element, cw, ch float32, commit bool) (usedW, usedH float32) {
+func boxLayout(e *node, cw, ch float32, commit bool) (usedW, usedH float32) {
+	if e.form != nil {
+		e.form.alignLabels()
+	}
+	if e.colFit != nil {
+		e.colFit.apply()
+	}
 	if e.grid {
 		return gridLayout(e, cw, ch, commit)
 	}
@@ -360,11 +428,13 @@ func boxLayout(e *Element, cw, ch float32, commit bool) (usedW, usedH float32) {
 }
 
 // layoutBox gives the element its size and lays out its content.
-func layoutBox(e *Element, w, h float32) {
+func layoutBox(e *node, w, h float32) {
 	e.w, e.h = w, h
 	cw, ch := max(w-e.padX(), 0), max(h-e.padY(), 0)
 	switch e.kind {
 	case kindText:
+		// Lists may build paragraphs while laying out, after the view's pass.
+		e.prepareSelectable()
 		e.tl = textSystem().Layout(e.textParams(max(cw, 1)))
 		if ed := e.st.editor; ed != nil && e.flags&flagSelectable != 0 {
 			// Selectable text hit-tests and selects in what it shows.
@@ -378,6 +448,13 @@ func layoutBox(e *Element, w, h float32) {
 	case kindImage, kindIcon:
 		return
 	}
+	if e.list != nil {
+		e.layoutList(w, h)
+		return
+	}
+	if e.overflow != nil {
+		e.layoutToolbar(cw)
+	}
 	lw, lh := cw, ch
 	if e.flags&flagScrollX != 0 {
 		lw = inf
@@ -386,15 +463,18 @@ func layoutBox(e *Element, w, h float32) {
 		lh = inf
 	}
 	uw, uh := boxLayout(e, lw, lh, true)
+	if e.baselines {
+		alignBaselines(e)
+	}
 	if e.scrolls() {
-		e.contentW = max(uw, cw) + e.padX()
-		e.contentH = max(uh, ch) + e.padY()
+		e.contentW = float64(max(uw, cw) + e.padX())
+		e.contentH = float64(max(uh, ch) + e.padY())
 	}
 	layoutAbsolute(e)
 }
 
 type flexItem struct {
-	e                    *Element
+	e                    *node
 	base, hyp            float32
 	minMain, maxMain     float32
 	main, cross          float32
@@ -435,7 +515,7 @@ func b2i(b bool) int {
 // flexLayout lays out the in-flow children in a content box cw×ch (inf
 // when unknown) and returns the size they take. With commit it gives them
 // their boxes (relative to e) and lays them out in turn.
-func flexLayout(e *Element, cw, ch float32, commit bool) (usedW, usedH float32) {
+func flexLayout(e *node, cw, ch float32, commit bool) (usedW, usedH float32) {
 	row := e.row
 	mainSize, crossSize := ch, cw
 	gap, crossGap := e.gapY, e.gapX
@@ -719,7 +799,7 @@ func flexLayout(e *Element, cw, ch float32, commit bool) (usedW, usedH float32) 
 
 // crossOf returns the width a column child gets: stretched to the column
 // or fitting its content.
-func crossOf(c *Element, cw float32, align Align) float32 {
+func crossOf(c *node, cw float32, align Align) float32 {
 	if v, ok := c.width.resolve(base(cw)); ok {
 		return c.clampW(v, cw)
 	}
@@ -732,12 +812,12 @@ func crossOf(c *Element, cw float32, align Align) float32 {
 // stretches reports whether c stretches across the line of a row (or a
 // column), as aligning by align asks, which icons do not, as they keep
 // their size, nor elements with automatic margins across it.
-func stretches(c *Element, align Align, row bool) bool {
+func stretches(c *node, align Align, row bool) bool {
 	m := crossMargins[b2i(row)]
 	return selfAlign(c, align) == Stretch && c.kind != kindIcon && !isAuto(c.margin[m[0]]) && !isAuto(c.margin[m[1]])
 }
 
-func selfAlign(c *Element, align Align) Align {
+func selfAlign(c *node, align Align) Align {
 	if c.self != alignAuto {
 		return c.self
 	}
@@ -829,10 +909,19 @@ func justifyOffsets(j Align, free float32, n int) (start, between float32) {
 }
 
 // layoutAbsolute places the absolute children in the padding box.
-func layoutAbsolute(e *Element) {
+func layoutAbsolute(e *node) {
 	pw, ph := e.w-e.border[1]-e.border[3], e.h-e.border[0]-e.border[2]
 	for c := e.first; c != nil; c = c.next {
-		if c.flags&flagAbsolute == 0 {
+		if c.flags&flagAbsolute == 0 || c.leaving != 0 {
+			// Copies of elements leaving are placed by their transitions.
+			continue
+		}
+		if c.attach != 0 {
+			if c.popover != nil {
+				attachTo(c, e, pw, ph)
+			} else {
+				attach(c, e, pw, ph)
+			}
 			continue
 		}
 		top, tok := c.inset[0].resolve(ph)
@@ -854,9 +943,6 @@ func layoutAbsolute(e *Element) {
 			h = c.clampH(ph-top-bottom-c.marginY(), ph)
 		} else {
 			h = heightAt(c, w, ph)
-		}
-		if c.place.on {
-			left, top = c.place.fit(c, left, top, w, h, pw, ph)
 		}
 		x := left + c.m(3)
 		if !lok && rok {
@@ -886,4 +972,136 @@ func layoutAbsolute(e *Element) {
 		c.x, c.y = e.border[3]+x, e.border[0]+y
 		layoutBox(c, w, h)
 	}
+}
+
+// attachTo places c, a child of e whose padding box is pw×ph, attached to
+// a point of the box of the element it is a popover of (AttachTo).
+func attachTo(c, e *node, pw, ph float32) {
+	var w float32
+	if v, ok := c.width.resolve(pw); ok {
+		w = c.clampW(v, pw)
+	} else {
+		w = fitWidth(c, pw, pw)
+	}
+	var h float32
+	if v, ok := c.height.resolve(ph); ok {
+		h = c.clampH(v, ph)
+	} else {
+		h = heightAt(c, w, ph)
+	}
+	t := laidOutVisualBox(c.popover)
+	at, self := c.attach.anchors()
+	ax, ay := at.fractions()
+	sx, sy := self.fractions()
+	x := alongTarget(t.X, t.W, ax, sx, w, c.m(3)-c.m(1), c.c.w)
+	y := alongTarget(t.Y, t.H, ay, sy, h, c.m(0)-c.m(2), c.c.h)
+	dx, dy := c.relative(pw, ph)
+	ox, oy := laidOutOrigin(e)
+	c.x, c.y = x+dx-ox, y+dy-oy
+	layoutBox(c, w, h)
+}
+
+// windowMargin keeps what overlays place apart from the window's edges.
+const windowMargin = 4
+
+// alongTarget returns where an element size long goes along an axis of the
+// window, limit long, with its point at fraction self on target's point at
+// fraction at, moved by off: on the other side of target, or the other way
+// along it, where that overflows the window less, then moved into the
+// window along target.
+func alongTarget(t0, tsize, at, self, size, off, limit float32) float32 {
+	pos := func(at, self, off float32) float32 { return t0 + at*tsize - self*size + off }
+	over := func(p float32) float32 {
+		return max(0, windowMargin-p) + max(0, p+size-(limit-windowMargin))
+	}
+	p := pos(at, self, off)
+	if over(p) > 0 {
+		if q := pos(1-at, 1-self, -off); over(q) < over(p) {
+			p = q
+		}
+	}
+	beside := at == 1 && self == 0 || at == 0 && self == 1
+	if !beside && over(p) > 0 {
+		p = max(windowMargin, min(p, limit-windowMargin-size))
+	}
+	return p
+}
+
+// laidOutOrigin returns where place will put the box of an element laid
+// out, in the window: its position and those of the elements around it,
+// less the offsets of the scroll containers among them.
+func laidOutOrigin(e *node) (x, y float32) {
+	x, y = e.x, e.y
+	for ch, p := e, e.parent; p != nil; ch, p = p, p.parent {
+		if ch.flags&flagAbsolute == 0 || ch.leaving == 1 {
+			if f := p.followX; f != nil {
+				x -= float32(f.st.scrollX)
+			}
+			if p.scrolls() {
+				x -= float32(p.st.scrollX)
+				y -= float32(p.st.scrollY - p.scrollBase)
+			}
+		}
+		x += p.x
+		y += p.y
+	}
+	return x, y
+}
+
+// laidOutBox returns where place, or commit for an inline element, will
+// put the box of an element of the frame, in the window, as its overlays
+// are laid out; that of the last frame for one this frame did not build.
+func laidOutBox(e *node) Rect {
+	if e.st.seen != e.c.rt.frame || e.parent == nil {
+		return e.Bounds()
+	}
+	if !e.isInline() {
+		x, y := laidOutOrigin(e)
+		return Rect{x, y, e.w, e.h}
+	}
+	// The box around its text in the paragraph's layout.
+	start, end := e.runes[0], e.runes[1]
+	para := e.parent
+	for para.isInline() {
+		start, end = start+para.runes[0], end+para.runes[0]
+		para = para.parent
+	}
+	x, y := laidOutOrigin(para)
+	x, y = x+para.contentX(), y+para.contentY()
+	if para.tl == nil {
+		return Rect{x, y, 0, 0}
+	}
+	var box Rect
+	for i, r := range para.tl.Selection(start, end) {
+		if f := (Rect{x + r.X, y + r.Y, r.W, r.H}); i == 0 {
+			box = f
+		} else {
+			box = union(box, f)
+		}
+	}
+	return box
+}
+
+// attach places c, attached to a point of the padding box of its parent e,
+// pw×ph (Attach).
+func attach(c, e *node, pw, ph float32) {
+	var w float32
+	if v, ok := c.width.resolve(pw); ok {
+		w = c.clampW(v, pw)
+	} else {
+		w = fitWidth(c, pw, pw)
+	}
+	var h float32
+	if v, ok := c.height.resolve(ph); ok {
+		h = c.clampH(v, ph)
+	} else {
+		h = heightAt(c, w, ph)
+	}
+	at, self := c.attach.anchors()
+	ax, ay := at.fractions()
+	sx, sy := self.fractions()
+	dx, dy := c.relative(pw, ph)
+	c.x = e.border[3] + ax*pw - sx*w + dx
+	c.y = e.border[0] + ay*ph - sy*h + dy
+	layoutBox(c, w, h)
 }

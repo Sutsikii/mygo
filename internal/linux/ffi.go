@@ -154,6 +154,7 @@ var (
 	gVariantGetUint32              func(v ptr) uint32
 	gVariantGetUint64              func(v ptr) uint64
 	gVariantGetBoolean             func(v ptr) bool
+	gVariantGetDouble              func(v ptr) float64
 	gVariantGetString              func(v ptr, length *uintptr) ptr
 	gVariantUnref                  func(v ptr)
 	gVariantGetVariant             func(v ptr) ptr
@@ -180,12 +181,17 @@ var (
 	gdkMonitorGetGeometry       func(m ptr, r *gdkRectangle)
 	gdkMonitorGetWorkarea       func(m ptr, r *gdkRectangle)
 	gdkMonitorGetScaleFactor    func(m ptr) int32
+	gdkMonitorGetRefreshRate    func(m ptr) int32
+	gdkDisplayGetMonitorAtWin   func(d, w ptr) ptr
 	gdkMonitorGetModel          func(m ptr) ptr
 	gdkDisplayGetDefaultSeat    func(d ptr) ptr
 	gdkSeatGetPointer           func(s ptr) ptr
 	gdkDeviceGetPosition        func(dev ptr, screen *ptr, x, y *int32)
 	gdkWindowGetDevicePosition  func(w, dev ptr, x, y *int32, mask *uint32) ptr
 	gdkWindowGetDisplay         func(w ptr) ptr
+	gdkWindowGetFrameExtents    func(w ptr, r *gdkRectangle)
+	gdkWindowGetOrigin          func(w ptr, x, y *int32) int32
+	gdkWindowGetGeometry        func(w ptr, x, y, width, height *int32)
 	gdkWindowGetCursor          func(w ptr) ptr
 	gdkWindowSetCursor          func(w, cursor ptr)
 	gdkCursorNewFromName        func(d ptr, name *byte) ptr
@@ -263,6 +269,7 @@ var (
 	gtkWidgetHide                       func(w ptr)
 	gtkWidgetDestroy                    func(w ptr)
 	gtkWidgetGetVisible                 func(w ptr) bool
+	gtkWidgetGetMapped                  func(w ptr) bool
 	gtkWidgetSetOpacity                 func(w ptr, v float64)
 	gtkWidgetGetOpacity                 func(w ptr) float64
 	gtkWidgetGrabFocus                  func(w ptr)
@@ -300,6 +307,7 @@ var (
 	gtkMenuPopupAtRect                  func(menu, window ptr, rect *gdkRectangle, rectAnchor, menuAnchor int32, event ptr)
 	gtkMenuShellDeactivate              func(menu ptr)
 	gtkWidgetGetWindow                  func(w ptr) ptr
+	gtkWidgetRealize                    func(w ptr)
 	gtkWidgetGetAllocation              func(w ptr, a *gdkRectangle)
 	gtkAccelGroupNew                    func() ptr
 	gtkFileChooserNativeNew             func(title *byte, parent ptr, action int32, accept, cancel *byte) ptr
@@ -542,6 +550,7 @@ func load() error {
 	mustBind(g, &gVariantGetUint32, "g_variant_get_uint32")
 	mustBind(g, &gVariantGetUint64, "g_variant_get_uint64")
 	mustBind(g, &gVariantGetBoolean, "g_variant_get_boolean")
+	mustBind(g, &gVariantGetDouble, "g_variant_get_double")
 	mustBind(g, &gVariantGetString, "g_variant_get_string")
 	mustBind(g, &gVariantUnref, "g_variant_unref")
 	mustBind(g, &gVariantGetVariant, "g_variant_get_variant")
@@ -588,12 +597,17 @@ func load() error {
 	mustBind(d, &gdkMonitorGetGeometry, "gdk_monitor_get_geometry")
 	mustBind(d, &gdkMonitorGetWorkarea, "gdk_monitor_get_workarea")
 	mustBind(d, &gdkMonitorGetScaleFactor, "gdk_monitor_get_scale_factor")
+	mustBind(d, &gdkMonitorGetRefreshRate, "gdk_monitor_get_refresh_rate")
+	mustBind(d, &gdkDisplayGetMonitorAtWin, "gdk_display_get_monitor_at_window")
 	mustBind(d, &gdkMonitorGetModel, "gdk_monitor_get_model")
 	mustBind(d, &gdkDisplayGetDefaultSeat, "gdk_display_get_default_seat")
 	mustBind(d, &gdkSeatGetPointer, "gdk_seat_get_pointer")
 	mustBind(d, &gdkDeviceGetPosition, "gdk_device_get_position")
 	mustBind(d, &gdkWindowGetDevicePosition, "gdk_window_get_device_position")
 	mustBind(d, &gdkWindowGetDisplay, "gdk_window_get_display")
+	mustBind(d, &gdkWindowGetFrameExtents, "gdk_window_get_frame_extents")
+	mustBind(d, &gdkWindowGetOrigin, "gdk_window_get_origin")
+	mustBind(d, &gdkWindowGetGeometry, "gdk_window_get_geometry")
 	mustBind(d, &gdkWindowGetCursor, "gdk_window_get_cursor")
 	mustBind(d, &gdkWindowSetCursor, "gdk_window_set_cursor")
 	mustBind(d, &gdkCursorNewFromName, "gdk_cursor_new_from_name")
@@ -659,6 +673,7 @@ func load() error {
 	mustBind(t, &gtkWidgetHide, "gtk_widget_hide")
 	mustBind(t, &gtkWidgetDestroy, "gtk_widget_destroy")
 	mustBind(t, &gtkWidgetGetVisible, "gtk_widget_get_visible")
+	mustBind(t, &gtkWidgetGetMapped, "gtk_widget_get_mapped")
 	mustBind(t, &gtkWidgetSetOpacity, "gtk_widget_set_opacity")
 	mustBind(t, &gtkWidgetGetOpacity, "gtk_widget_get_opacity")
 	mustBind(t, &gtkWidgetGrabFocus, "gtk_widget_grab_focus")
@@ -696,6 +711,7 @@ func load() error {
 	mustBind(t, &gtkMenuPopupAtRect, "gtk_menu_popup_at_rect")
 	mustBind(t, &gtkMenuShellDeactivate, "gtk_menu_shell_deactivate")
 	mustBind(t, &gtkWidgetGetWindow, "gtk_widget_get_window")
+	mustBind(t, &gtkWidgetRealize, "gtk_widget_realize")
 	mustBind(t, &gtkWidgetGetAllocation, "gtk_widget_get_allocation")
 	mustBind(t, &gtkAccelGroupNew, "gtk_accel_group_new")
 	mustBind(t, &gtkFileChooserNativeNew, "gtk_file_chooser_native_new")

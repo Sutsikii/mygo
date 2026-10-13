@@ -8,11 +8,16 @@ import (
 	"log"
 	"math"
 	"runtime"
+	"slices"
 	"strings"
+	"sync"
+	"unicode"
 	"unsafe"
 
 	"github.com/ebitengine/purego"
 	"github.com/ebitengine/purego/objc"
+	"github.com/egoist/mygo/internal/scene"
+	"github.com/go-text/typesetting/segmenter"
 )
 
 // Core Text lays out paragraphs: a typesetter finds the fonts, falls back
@@ -108,6 +113,14 @@ var ct struct {
 	fontGetLeading        func(font uintptr) float64
 	fontGetSize           func(font uintptr) float64
 	fontGetSymbolicTraits func(font uintptr) uint32
+	fontGetUnderlinePos   func(font uintptr) float64
+	fontGetUnderlineThick func(font uintptr) float64
+	fontGetXHeight        func(font uintptr) float64
+	fontGetUnitsPerEm     func(font uintptr) uint32
+	fontCopyTable         func(font uintptr, tag uint32, options uint32) uintptr
+	fontCreatePath        func(font uintptr, glyph uint16, matrix uintptr) uintptr
+	dataGetLength         func(data uintptr) int
+	dataGetBytePtr        func(data uintptr) *byte
 	fontGetBoundingRects  func(font uintptr, orientation uint32, glyphs *uint16, rects *cgRect, n int) cgRect
 	fontDrawGlyphs        func(font uintptr, glyphs *uint16, positions *cgPoint, n int, context uintptr)
 	paragraphStyleCreate  func(settings *ctParagraphStyleSetting, n int) uintptr
@@ -147,6 +160,8 @@ var ct struct {
 	contextQuantize         func(ctx uintptr, on bool)
 	contextScaleCTM         func(ctx uintptr, sx, sy float64)
 	contextSetFill          func(ctx uintptr, r, g, b, a float64)
+	pathApply               func(path, info, fn uintptr)
+	pathRelease             func(path uintptr)
 
 	// Objective-C
 	poolPush func() uintptr
@@ -193,25 +208,23 @@ func loadCoreText() error {
 	if len(missing) > 0 {
 		return fmt.Errorf("cannot load %s", strings.Join(missing, ", "))
 	}
-	bind(cf, &ct.release, "CFRelease")
-	bind(cf, &ct.retain, "CFRetain")
-	bind(cf, &ct.hash, "CFHash")
-	bind(cf, &ct.equal, "CFEqual")
-	bind(cf, &ct.stringWithCharacters, "CFStringCreateWithCharacters")
+	bindDirect(cf, text, addr)
+	bind(cf, &ct.dataGetLength, "CFDataGetLength")
+	bind(cf, &ct.dataGetBytePtr, "CFDataGetBytePtr")
+	bind(text, &ct.fontGetUnderlinePos, "CTFontGetUnderlinePosition")
+	bind(text, &ct.fontGetUnderlineThick, "CTFontGetUnderlineThickness")
+	bind(text, &ct.fontGetXHeight, "CTFontGetXHeight")
+	bind(text, &ct.fontGetUnitsPerEm, "CTFontGetUnitsPerEm")
+	bind(text, &ct.fontCopyTable, "CTFontCopyTable")
+	bind(text, &ct.fontCreatePath, "CTFontCreatePathForGlyph")
+	bind(cg, &ct.pathApply, "CGPathApply")
+	bind(cg, &ct.pathRelease, "CGPathRelease")
 	bind(cf, &ct.stringWithBytes, "CFStringCreateWithBytes")
 	bind(cf, &ct.stringGetLength, "CFStringGetLength")
 	bind(cf, &ct.stringGetCharacters, "CFStringGetCharacters")
-	bind(cf, &ct.dictionaryCreate, "CFDictionaryCreate")
-	bind(cf, &ct.dictionaryGetValue, "CFDictionaryGetValue")
-	bind(cf, &ct.arrayGetCount, "CFArrayGetCount")
-	bind(cf, &ct.arrayGetValueAtIndex, "CFArrayGetValueAtIndex")
 	bind(cf, &ct.setCreate, "CFSetCreate")
 	bind(cf, &ct.arrayCreate, "CFArrayCreate")
-	bind(cf, &ct.numberCreate, "CFNumberCreate")
 	bind(cf, &ct.numberGetValue, "CFNumberGetValue")
-	bind(cf, &ct.attributedString, "CFAttributedStringCreate")
-	bind(cf, &ct.attributedMutable, "CFAttributedStringCreateMutableCopy")
-	bind(cf, &ct.attributedSet, "CFAttributedStringSetAttribute")
 	bind(cf, &ct.dataCreate, "CFDataCreate")
 	ct.keyCallbacks = addr(cf, "kCFTypeDictionaryKeyCallBacks")
 	ct.valueCallbacks = addr(cf, "kCFTypeDictionaryValueCallBacks")
@@ -238,19 +251,7 @@ func loadCoreText() error {
 	bind(text, &ct.fontGetBoundingRects, "CTFontGetBoundingRectsForGlyphs")
 	bind(text, &ct.fontDrawGlyphs, "CTFontDrawGlyphs")
 	bind(text, &ct.paragraphStyleCreate, "CTParagraphStyleCreate")
-	bind(text, &ct.typesetterCreate, "CTTypesetterCreateWithAttributedString")
 	bind(text, &ct.suggestLineBreak, "CTTypesetterSuggestLineBreak")
-	bind(text, &ct.typesetterCreateLine, "CTTypesetterCreateLine")
-	bind(text, &ct.lineGetGlyphRuns, "CTLineGetGlyphRuns")
-	bind(text, &ct.lineGetStringRange, "CTLineGetStringRange")
-	bind(text, &ct.runGetGlyphCount, "CTRunGetGlyphCount")
-	bind(text, &ct.runGetStringRange, "CTRunGetStringRange")
-	bind(text, &ct.runGetStatus, "CTRunGetStatus")
-	bind(text, &ct.runGetAttributes, "CTRunGetAttributes")
-	bind(text, &ct.runGetGlyphs, "CTRunGetGlyphs")
-	bind(text, &ct.runGetPositions, "CTRunGetPositions")
-	bind(text, &ct.runGetAdvances, "CTRunGetAdvances")
-	bind(text, &ct.runGetStringIndices, "CTRunGetStringIndices")
 	bind(cg, &ct.colorSpaceDeviceRGB, "CGColorSpaceCreateDeviceRGB")
 	bind(cg, &ct.bitmapContextCreate, "CGBitmapContextCreate")
 	bind(cg, &ct.contextRelease, "CGContextRelease")
@@ -292,15 +293,128 @@ func loadCoreText() error {
 	return nil
 }
 
+// bindDirect binds the functions of Core Foundation and Core Text that
+// each layout calls to call them through purego.SyscallN, which allocates
+// once a call where RegisterFunc's reflection allocates three or more
+// times. They take integers, pointers and CFRanges, which C passes in two
+// integer registers and returns in the first two on arm64 and amd64, as
+// SyscallN's r1 and r2.
+func bindDirect(cf, text uintptr, addr func(lib uintptr, name string) uintptr) {
+	release, retain := addr(cf, "CFRelease"), addr(cf, "CFRetain")
+	ct.release = func(obj uintptr) { purego.SyscallN(release, obj) }
+	ct.retain = func(obj uintptr) uintptr { r, _, _ := purego.SyscallN(retain, obj); return r }
+	hash, equal := addr(cf, "CFHash"), addr(cf, "CFEqual")
+	ct.hash = func(obj uintptr) uint { r, _, _ := purego.SyscallN(hash, obj); return uint(r) }
+	ct.equal = func(a, b uintptr) bool { r, _, _ := purego.SyscallN(equal, a, b); return uint8(r) != 0 }
+	stringWithCharacters := addr(cf, "CFStringCreateWithCharacters")
+	ct.stringWithCharacters = func(alloc uintptr, chars *uint16, n int) uintptr {
+		r, _, _ := purego.SyscallN(stringWithCharacters, alloc, uintptr(unsafe.Pointer(chars)), uintptr(n))
+		return r
+	}
+	dictionaryCreate, dictionaryGetValue := addr(cf, "CFDictionaryCreate"), addr(cf, "CFDictionaryGetValue")
+	ct.dictionaryCreate = func(alloc uintptr, keys, values *uintptr, n int, keyCallbacks, valueCallbacks uintptr) uintptr {
+		r, _, _ := purego.SyscallN(dictionaryCreate, alloc, uintptr(unsafe.Pointer(keys)), uintptr(unsafe.Pointer(values)), uintptr(n), keyCallbacks, valueCallbacks)
+		return r
+	}
+	ct.dictionaryGetValue = func(d, key uintptr) uintptr { r, _, _ := purego.SyscallN(dictionaryGetValue, d, key); return r }
+	arrayGetCount, arrayGetValueAtIndex := addr(cf, "CFArrayGetCount"), addr(cf, "CFArrayGetValueAtIndex")
+	ct.arrayGetCount = func(a uintptr) int { r, _, _ := purego.SyscallN(arrayGetCount, a); return int(r) }
+	ct.arrayGetValueAtIndex = func(a uintptr, i int) uintptr {
+		r, _, _ := purego.SyscallN(arrayGetValueAtIndex, a, uintptr(i))
+		return r
+	}
+	numberCreate := addr(cf, "CFNumberCreate")
+	ct.numberCreate = func(alloc uintptr, typ int, value unsafe.Pointer) uintptr {
+		r, _, _ := purego.SyscallN(numberCreate, alloc, uintptr(typ), uintptr(value))
+		return r
+	}
+	attributedString, attributedMutable := addr(cf, "CFAttributedStringCreate"), addr(cf, "CFAttributedStringCreateMutableCopy")
+	attributedSet := addr(cf, "CFAttributedStringSetAttribute")
+	ct.attributedString = func(alloc, str, attrs uintptr) uintptr {
+		r, _, _ := purego.SyscallN(attributedString, alloc, str, attrs)
+		return r
+	}
+	ct.attributedMutable = func(alloc uintptr, max int, attributed uintptr) uintptr {
+		r, _, _ := purego.SyscallN(attributedMutable, alloc, uintptr(max), attributed)
+		return r
+	}
+	ct.attributedSet = func(attributed uintptr, r cfRange, name, value uintptr) {
+		purego.SyscallN(attributedSet, attributed, uintptr(r.location), uintptr(r.length), name, value)
+	}
+	typesetterCreate, typesetterCreateLine := addr(text, "CTTypesetterCreateWithAttributedString"), addr(text, "CTTypesetterCreateLine")
+	ct.typesetterCreate = func(str uintptr) uintptr { r, _, _ := purego.SyscallN(typesetterCreate, str); return r }
+	ct.typesetterCreateLine = func(typesetter uintptr, r cfRange) uintptr {
+		line, _, _ := purego.SyscallN(typesetterCreateLine, typesetter, uintptr(r.location), uintptr(r.length))
+		return line
+	}
+	lineGetGlyphRuns, lineGetStringRange := addr(text, "CTLineGetGlyphRuns"), addr(text, "CTLineGetStringRange")
+	ct.lineGetGlyphRuns = func(line uintptr) uintptr { r, _, _ := purego.SyscallN(lineGetGlyphRuns, line); return r }
+	ct.lineGetStringRange = func(line uintptr) cfRange {
+		loc, n, _ := purego.SyscallN(lineGetStringRange, line)
+		return cfRange{int(loc), int(n)}
+	}
+	runGetGlyphCount, runGetStringRange := addr(text, "CTRunGetGlyphCount"), addr(text, "CTRunGetStringRange")
+	runGetStatus, runGetAttributes := addr(text, "CTRunGetStatus"), addr(text, "CTRunGetAttributes")
+	ct.runGetGlyphCount = func(run uintptr) int { r, _, _ := purego.SyscallN(runGetGlyphCount, run); return int(r) }
+	ct.runGetStringRange = func(run uintptr) cfRange {
+		loc, n, _ := purego.SyscallN(runGetStringRange, run)
+		return cfRange{int(loc), int(n)}
+	}
+	ct.runGetStatus = func(run uintptr) uint32 { r, _, _ := purego.SyscallN(runGetStatus, run); return uint32(r) }
+	ct.runGetAttributes = func(run uintptr) uintptr { r, _, _ := purego.SyscallN(runGetAttributes, run); return r }
+	runGetGlyphs, runGetPositions := addr(text, "CTRunGetGlyphs"), addr(text, "CTRunGetPositions")
+	runGetAdvances, runGetStringIndices := addr(text, "CTRunGetAdvances"), addr(text, "CTRunGetStringIndices")
+	ct.runGetGlyphs = func(run uintptr, r cfRange, out *uint16) {
+		purego.SyscallN(runGetGlyphs, run, uintptr(r.location), uintptr(r.length), uintptr(unsafe.Pointer(out)))
+	}
+	ct.runGetPositions = func(run uintptr, r cfRange, out *cgPoint) {
+		purego.SyscallN(runGetPositions, run, uintptr(r.location), uintptr(r.length), uintptr(unsafe.Pointer(out)))
+	}
+	ct.runGetAdvances = func(run uintptr, r cfRange, out *cgSize) {
+		purego.SyscallN(runGetAdvances, run, uintptr(r.location), uintptr(r.length), uintptr(unsafe.Pointer(out)))
+	}
+	ct.runGetStringIndices = func(run uintptr, r cfRange, out *int) {
+		purego.SyscallN(runGetStringIndices, run, uintptr(r.location), uintptr(r.length), uintptr(unsafe.Pointer(out)))
+	}
+}
+
 type coreText struct {
+	shapeScratch
 	styles [2]uintptr // paragraph styles: left-to-right, right-to-left
 	srgb   uintptr
+	smooth bool // the user leaves font smoothing on
+	// bands caches where glyphs' outlines cross underlines (inkInBand).
+	bands map[bandKey][2]float32
 
 	primary map[Style]uintptr // the CTFont of each style
 	fonts   map[uint][]*Font  // by CFHash of their CTFont
-	color   map[uintptr]bool
+	// native finds Fonts by their CTFont, which they retain.
+	native map[uintptr]*Font
+	// attrs are the attributes of strings in a font of primary, in each
+	// direction, without tracking or kerning, owned.
+	attrs map[attrsKey]uintptr
+	// seg and breaks find where lines may break (lineBreaks).
+	seg    segmenter.Segmenter
+	breaks []bool
+	color  map[uintptr]bool
+
+	// Buffers shape reuses: the text in UTF-16 with the rune of each code
+	// unit, the attributes of the string, the code unit of each rune, and
+	// what Core Text tells of a run.
+	u16          []uint16
+	index, at    []int
+	keys, values []uintptr
+	runIDs       []uint16
+	runPoints    []cgPoint
+	runAdvances  []cgSize
+	runIndices   []int
 
 	registered map[string][]registeredFace // by lowercased family
+}
+
+type attrsKey struct {
+	font uintptr
+	rtl  bool
 }
 
 type registeredFace struct {
@@ -316,8 +430,11 @@ func newCoreText() (*coreText, error) {
 	e := &coreText{
 		primary:    map[Style]uintptr{},
 		fonts:      map[uint][]*Font{},
+		native:     map[uintptr]*Font{},
+		attrs:      map[attrsKey]uintptr{},
 		color:      map[uintptr]bool{},
 		registered: map[string][]registeredFace{},
+		bands:      map[bandKey][2]float32{},
 	}
 	for i, dir := range [2]int8{0, 1} { // kCTWritingDirectionLeftToRight, RightToLeft
 		d := dir
@@ -331,7 +448,29 @@ func newCoreText() (*coreText, error) {
 	if e.srgb == 0 {
 		e.srgb = ct.colorSpaceDeviceRGB()
 	}
+	e.smooth = fontSmoothing()
 	return e, nil
+}
+
+// fontSmoothing reports whether the user leaves font smoothing on: AppKit
+// turns it off when AppleFontSmoothing is 0, or not a number, which Core
+// Graphics' bitmap contexts do not heed.
+func fontSmoothing() bool {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	pool := ct.poolPush()
+	defer ct.poolPop(pool)
+	cls := objc.ID(objc.GetClass("NSUserDefaults"))
+	if cls == 0 {
+		return true
+	}
+	defaults := cls.Send(objc.RegisterName("standardUserDefaults"))
+	key := cfString("AppleFontSmoothing")
+	defer ct.release(key)
+	if defaults.Send(objc.RegisterName("objectForKey:"), key) == 0 {
+		return true
+	}
+	return objc.Send[int](defaults, objc.RegisterName("integerForKey:"), key) != 0
 }
 
 func cfString(s string) uintptr {
@@ -459,10 +598,7 @@ func (e *coreText) ctFont(style Style) uintptr {
 		return f
 	}
 	if len(e.primary) >= 256 {
-		for _, f := range e.primary {
-			ct.release(f)
-		}
-		clear(e.primary)
+		e.forgetPrimary()
 	}
 	if key.Features != "" {
 		// The font without the features, with them.
@@ -543,7 +679,9 @@ func (e *coreText) ctFont(style Style) uintptr {
 func (e *coreText) styleSpans(attributed uintptr, style Style, spans []Span, text []rune) uintptr {
 	styled := ct.attributedMutable(0, 0, attributed)
 	// The UTF-16 code unit of each rune.
-	at := make([]int, len(text)+1)
+	e.at = slices.Grow(e.at[:0], len(text)+1)[:len(text)+1]
+	at := e.at
+	at[0] = 0
 	for i, r := range text {
 		at[i+1] = at[i] + 1
 		if r >= 0x10000 {
@@ -650,6 +788,9 @@ func (e *coreText) font(style Style) *Font {
 
 // fontOf returns the Font of a CTFont.
 func (e *coreText) fontOf(font uintptr) *Font {
+	if f, ok := e.native[font]; ok {
+		return f
+	}
 	h := ct.hash(font)
 	for _, f := range e.fonts[h] {
 		if f.native == font || ct.equal(f.native, font) {
@@ -663,9 +804,12 @@ func (e *coreText) fontOf(font uintptr) *Font {
 		Descent: float32(ct.fontGetDescent(font)),
 		LineGap: float32(ct.fontGetLeading(font)),
 		native:  font,
-		shaded:  !e.isColor(font),
+		shaded:  e.smooth && !e.isColor(font),
+		// Smoothing thickens glyphs, whatever the user's setting.
+		thickens: !e.isColor(font),
 	}
 	e.fonts[h] = append(e.fonts[h], f)
+	e.native[font] = f
 	return f
 }
 
@@ -674,7 +818,8 @@ func (e *coreText) shape(text []rune, style Style, spans []Span, width float32, 
 	if font == 0 || len(text) == 0 {
 		return nil
 	}
-	u16, index := utf16Text(text)
+	e.u16, e.index = appendUTF16(e.u16[:0], e.index[:0], text)
+	u16, index := e.u16, e.index
 	n := len(u16)
 	str := ct.stringWithCharacters(0, &u16[0], n)
 	defer ct.release(str)
@@ -682,7 +827,8 @@ func (e *coreText) shape(text []rune, style Style, spans []Span, width float32, 
 	if rtl {
 		paragraph = e.styles[1]
 	}
-	keys, values := []uintptr{ct.fontAttributeName, ct.paragraphStyleName}, []uintptr{font, paragraph}
+	attrs, cached := e.attrs[attrsKey{font, rtl}]
+	keys, values := append(e.keys[:0], ct.fontAttributeName, ct.paragraphStyleName), append(e.values[:0], font, paragraph)
 	if style.LetterSpacing != 0 && ct.trackingName != 0 {
 		// Tracking, in points as DIPs, keeps the font's kerning.
 		tracking := cfFloat(float64(style.LetterSpacing))
@@ -694,8 +840,16 @@ func (e *coreText) shape(text []rune, style Style, spans []Span, width float32, 
 		defer ct.release(zero)
 		keys, values = append(keys, ct.kernName), append(values, zero)
 	}
-	attrs := cfDictionary(keys, values)
-	defer ct.release(attrs)
+	e.keys, e.values = keys, values
+	switch {
+	case len(keys) > 2:
+		attrs = cfDictionary(keys, values)
+		defer ct.release(attrs)
+	case !cached:
+		// The font of a style lives in primary, with its attributes.
+		attrs = cfDictionary(keys, values)
+		e.attrs[attrsKey{font, rtl}] = attrs
+	}
 	attributed := ct.attributedString(0, str, attrs)
 	defer ct.release(attributed)
 	if len(spans) > 0 {
@@ -710,9 +864,11 @@ func (e *coreText) shape(text []rune, style Style, spans []Span, width float32, 
 	defer ct.release(typesetter)
 	var breaks []bool
 	if wholeWords && width > 0 {
-		breaks = lineBreaks(text)
+		e.breaks = lineBreaks(&e.seg, e.breaks, text)
+		breaks = e.breaks
 	}
 	var lines []shapedLine
+	mark := len(e.shapeScratch.lines)
 	for start := 0; start < n; {
 		count := n - start
 		if width > 0 {
@@ -731,7 +887,7 @@ func (e *coreText) shape(text []rune, style Style, spans []Span, width float32, 
 		if line == 0 {
 			break
 		}
-		lines = append(lines, e.line(line, index, n))
+		lines = e.addLine(mark, e.line(line, index, n))
 		ct.release(line)
 		start += count
 	}
@@ -743,23 +899,25 @@ func (e *coreText) line(line uintptr, index []int, n int) shapedLine {
 	r := ct.lineGetStringRange(line)
 	sl := shapedLine{start: at(r.location), end: at(r.location + r.length)}
 	runs := ct.lineGetGlyphRuns(line)
+	mark := len(e.shapeScratch.runs)
 	for i := range ct.arrayGetCount(runs) {
 		run := ct.arrayGetValueAtIndex(runs, i)
 		rr := ct.runGetStringRange(run)
 		f := e.fontOf(ct.dictionaryGetValue(ct.runGetAttributes(run), ct.fontAttributeName))
 		sr := shapedRun{font: f, start: at(rr.location), end: at(rr.location + rr.length)}
 		if count := ct.runGetGlyphCount(run); count > 0 {
-			glyphs := make([]uint16, count)
-			positions := make([]cgPoint, count)
-			advances := make([]cgSize, count)
-			indices := make([]int, count)
+			e.runIDs = slices.Grow(e.runIDs[:0], count)[:count]
+			e.runPoints = slices.Grow(e.runPoints[:0], count)[:count]
+			e.runAdvances = slices.Grow(e.runAdvances[:0], count)[:count]
+			e.runIndices = slices.Grow(e.runIndices[:0], count)[:count]
+			glyphs, positions, advances, indices := e.runIDs, e.runPoints, e.runAdvances, e.runIndices
 			all := cfRange{}
 			ct.runGetGlyphs(run, all, &glyphs[0])
 			ct.runGetPositions(run, all, &positions[0])
 			ct.runGetAdvances(run, all, &advances[0])
 			ct.runGetStringIndices(run, all, &indices[0])
 			rtl := ct.runGetStatus(run)&ctRunStatusRightToLeft != 0
-			sr.glyphs = make([]Glyph, count)
+			sr.glyphs = e.glyphRoom(count)
 			for j := range count {
 				sr.glyphs[j] = Glyph{
 					Font: f, ID: uint32(glyphs[j]),
@@ -769,7 +927,7 @@ func (e *coreText) line(line uintptr, index []int, n int) shapedLine {
 				}
 			}
 		}
-		sl.runs = append(sl.runs, sr)
+		sl.runs = e.addRun(mark, sr)
 	}
 	return sl
 }
@@ -783,7 +941,27 @@ func (e *coreText) isColor(font uintptr) bool {
 	return c
 }
 
-func (e *coreText) glyph(f *Font, id uint32, scale, dx float32, shade Shade) bitmap {
+// positions follows Core Graphics' subpixel quantization, which AppKit
+// leaves on: glyphs go to the position left of their pen, among fewer the
+// larger they are, at most five a pixel and one from 34 pixels an em.
+func (e *coreText) positions(f *Font, scale float32, _ bool) (int, bool) {
+	px := float64(f.Size * scale)
+	if px <= 0 {
+		return 1, false
+	}
+	return min(5, max(1, int(math.Ceil(100/(3*px)-1e-9)))), false
+}
+
+// baseline is the whole pixel at or below y: Core Graphics draws a glyph
+// from the pixel below its pen in its y-up space, as AppKit does on
+// flipped views.
+func (e *coreText) baseline(y float32) float32 { return float32(math.Ceil(float64(y) - 1e-3)) }
+
+// textParams leaves coverage as it is: Core Graphics blends text in sRGB
+// space, as renderers do, without subpixels since macOS 10.14.
+func (e *coreText) textParams() (scene.TextParams, bool) { return scene.TextParams{}, false }
+
+func (e *coreText) glyph(f *Font, id uint32, scale, dx float32, shade Shade, _ bool) bitmap {
 	font := f.native
 	g := uint16(id)
 	var r cgRect
@@ -793,8 +971,9 @@ func (e *coreText) glyph(f *Font, id uint32, scale, dx float32, shade Shade) bit
 	}
 	s, x := float64(scale), float64(dx)
 	// Smoothing spreads a glyph up to a pixel further.
+	smooth := f.shaded && shade != Flat || shade == Thick
 	pad := 1
-	if f.shaded {
+	if smooth {
 		pad = 2
 	}
 	// Core Graphics' y goes up: the box from r.y to r.y+r.h above the
@@ -821,16 +1000,19 @@ func (e *coreText) glyph(f *Font, id uint32, scale, dx float32, shade Shade) bit
 		return bitmap{}
 	}
 	ct.contextAntialias(ctx, true)
-	// Font smoothing, unless the user turned it off (AppleFontSmoothing),
-	// emboldens glyphs more the lighter the fill color is, even in a
-	// context of alpha alone: the gray of the shade sets how much.
-	ct.contextSmoothFonts(ctx, f.shaded)
+	// Font smoothing emboldens glyphs more the lighter the fill color is,
+	// even in a context of alpha alone: the gray of the shade sets how
+	// much. Fonts are shaded while the user leaves it on; thick text is
+	// smoothed with white, the most.
+	ct.contextSmoothFonts(ctx, smooth)
 	ct.contextAllowSubpixelPos(ctx, true)
 	ct.contextSubpixelPos(ctx, true)
 	ct.contextAllowQuantize(ctx, false)
 	ct.contextQuantize(ctx, false)
 	fill := 0.0
-	if f.shaded {
+	if shade == Thick {
+		fill = 1
+	} else if smooth {
 		fill = shadeGray(shade)
 	}
 	ct.contextSetFill(ctx, fill, fill, fill, 1)
@@ -842,6 +1024,239 @@ func (e *coreText) glyph(f *Font, id uint32, scale, dx float32, shade Shade) bit
 	ct.contextRelease(ctx)
 	runtime.KeepAlive(pix)
 	return bitmap{left: left, top: top, w: w, h: h, pix: pix, color: color}
+}
+
+// decorate places underlines and strikethroughs as Core Text draws them
+// for AppKit, which snaps them in points, the DIPs of a screen, from the
+// baseline: an underline as low and thick as those of the fonts of the
+// glyphs under it want it, skipping their ink, a strikethrough through the
+// middle of the x-height of the text's own font, and both from where the
+// text starts to its width rounded up to a whole point, leaving out
+// whitespace starting or ending a line. The baseline is the glyphs', a
+// whole pixel, as AppKit's labels have on whole points.
+func (e *coreText) decorate(r decoRange) []Stroke {
+	gs := r.line.Glyphs
+	i, j := r.i, r.j
+	if i == 0 {
+		for i < j && unicode.IsSpace(r.rune(i)) {
+			i++
+		}
+	}
+	if j == len(gs) {
+		for j > i && unicode.IsSpace(r.rune(j-1)) {
+			j--
+		}
+	}
+	if i >= j {
+		return nil
+	}
+	x0, _ := r.span(i, j)
+	var width float32
+	for _, g := range gs[i:j] {
+		width += g.Advance
+	}
+	x1 := x0 + float32(math.Ceil(float64(width)-1e-4))
+	var center, thick float32 // below the baseline
+	if r.d == Strikethrough {
+		p, t := ctStrikethrough(r.font)
+		center, thick = -p, t
+	} else {
+		r.runs(func(f *Font, _, _ int) {
+			p, t := ctUnderline(f)
+			center, thick = max(center, p), max(thick, t)
+		})
+	}
+	pieces := [][2]float32{{x0, x1}}
+	if r.d == Underline {
+		var cuts [][2]float32
+		for k := i; k < j; k++ {
+			g := gs[k]
+			if g.Font == nil || !skipsInk(r.rune(k)) {
+				continue
+			}
+			if a, b, ok := e.inkInBand(g.Font, g.ID, -(center + thick/2), -(center - thick/2)); ok {
+				cuts = append(cuts, [2]float32{g.X + a - thick, g.X + b + thick})
+			}
+		}
+		pieces = cut(x0, x1, cuts, 0.75*thick)
+	}
+	s := r.scale
+	base := e.baseline(r.baseline() * s)
+	out := make([]Stroke, len(pieces))
+	for k, p := range pieces {
+		out[k] = Stroke{X0: (r.x + p[0]) * s, X1: (r.x + p[1]) * s, Top: base + (center-thick/2)*s, Bottom: base + (center+thick/2)*s}
+	}
+	return out
+}
+
+// ctUnderline returns where Core Text centers the underline of a font
+// below the baseline, and how thick it draws it, in points.
+func ctUnderline(f *Font) (center, thick float32) {
+	font := f.native
+	pos, th := ct.fontGetUnderlinePos(font), ct.fontGetUnderlineThick(font)
+	asc, desc := ct.fontGetAscent(font), ct.fontGetDescent(font)
+	d := desc
+	if desc < 2 {
+		d = (asc + desc) / 4
+	}
+	reach := min(d*5.3636991028295373, asc+desc)
+	if pos >= 0 { // no underline position
+		pos = -0.08805546253922189 * reach
+	}
+	p, t := -pos, th
+	if d >= 2 && th > 0.35 {
+		t = math.Ceil(th)
+		if t >= d || d <= 4 && t >= 3 || d <= 2.5 && t >= 2 {
+			t--
+		}
+		p = snapLine(p, t)
+		if p < 1.5 || p == 1.5 && d > 4 {
+			p++
+		}
+	}
+	if d > 0 {
+		p = min(p, math.Floor(d)-t/2)
+	}
+	p = max(p, math.Ceil(th)+t/2)
+	if t <= 0 { // no underline thickness
+		t = reach * 0.044027731269610945
+	}
+	return float32(p), float32(t)
+}
+
+// ctStrikethrough returns where Core Text centers the strikethrough of a
+// font above the baseline, and how thick it draws it, in points: through
+// the middle of the x-height, as thick as the underline.
+func ctStrikethrough(f *Font) (center, thick float32) {
+	font := f.native
+	p, th := ct.fontGetXHeight(font)/2, ct.fontGetUnderlineThick(font)
+	if p <= 0 {
+		// No x-height: the strikeout of the OS/2 table.
+		if t := ct.fontCopyTable(font, 0x4F532F32, 0); t != 0 {
+			if ct.dataGetLength(t) >= 30 {
+				b := unsafe.Slice(ct.dataGetBytePtr(t), 30)
+				size, pos := int16(uint16(b[26])<<8|uint16(b[27])), int16(uint16(b[28])<<8|uint16(b[29]))
+				em := ct.fontGetSize(font) / float64(max(ct.fontGetUnitsPerEm(font), 1))
+				p, th = (float64(pos)-float64(size)/2)*em, float64(size)*em
+			}
+			ct.release(t)
+		}
+	}
+	t := th
+	if p > 1 && th > 0.35 {
+		t = math.Ceil(th)
+		p = snapLine(p, t)
+	}
+	return float32(p), float32(t)
+}
+
+// join: Core Graphics blends each glyph of a run in turn.
+func (e *coreText) join() bool { return false }
+
+// snapLine puts a line of thickness t (whole points) centered at p on
+// whole points.
+func snapLine(p, t float64) float64 {
+	if int(t)%2 == 0 {
+		return math.Floor(p + 0.5)
+	}
+	return math.Floor(p) + 0.5
+}
+
+type bandKey struct {
+	font   uintptr
+	glyph  uint32
+	lo, hi float32
+}
+
+// inkInBand returns how far left and right of its origin the outline of a
+// glyph reaches between lo and hi points above the baseline.
+func (e *coreText) inkInBand(f *Font, id uint32, lo, hi float32) (a, b float32, ok bool) {
+	key := bandKey{f.native, id, lo, hi}
+	if v, seen := e.bands[key]; seen {
+		return v[0], v[1], v[0] <= v[1]
+	}
+	if len(e.bands) >= 4096 {
+		clear(e.bands)
+	}
+	segs := glyphOutline(f.native, uint16(id))
+	ax, bx, found := bandX(segs, float64(lo), float64(hi))
+	v := [2]float32{1, 0}
+	if found {
+		v = [2]float32{float32(ax), float32(bx)}
+	}
+	e.bands[key] = v
+	return v[0], v[1], found
+}
+
+// The outline of a glyph, flattened into segments, as CGPathApply hands
+// its elements to the one callback made for it.
+var (
+	outlineOnce sync.Once
+	outlineFn   uintptr
+	outlineSegs [][4]float64
+	outlineAt   [2]float64 // the current point
+	outlineFrom [2]float64 // the start of the subpath
+)
+
+type cgPathElement struct {
+	kind   int32
+	points *cgPoint
+}
+
+// glyphOutline returns the outline of a glyph in points, y up, as line
+// segments. The text system's lock serializes its callers.
+func glyphOutline(font uintptr, glyph uint16) [][4]float64 {
+	outlineOnce.Do(func() {
+		outlineFn = purego.NewCallback(func(_ uintptr, el *cgPathElement) uintptr {
+			pt := func(i int) [2]float64 {
+				p := unsafe.Slice(el.points, i+1)[i]
+				return [2]float64{p.x, p.y}
+			}
+			line := func(q [2]float64) {
+				outlineSegs = append(outlineSegs, [4]float64{outlineAt[0], outlineAt[1], q[0], q[1]})
+				outlineAt = q
+			}
+			switch el.kind {
+			case 0: // move
+				outlineAt = pt(0)
+				outlineFrom = outlineAt
+			case 1: // line
+				line(pt(0))
+			case 2, 3: // quadratic and cubic curves, in 16 lines
+				p0 := outlineAt
+				c := []([2]float64){p0, pt(0), pt(1)}
+				if el.kind == 3 {
+					c = append(c, pt(2))
+				}
+				for k := 1; k <= 16; k++ {
+					t := float64(k) / 16
+					line(bezier(c, t))
+				}
+			case 4: // close
+				line(outlineFrom)
+			}
+			return 0
+		})
+	})
+	outlineSegs = outlineSegs[:0]
+	path := ct.fontCreatePath(font, glyph, 0)
+	if path == 0 {
+		return nil
+	}
+	ct.pathApply(path, 0, outlineFn)
+	ct.pathRelease(path)
+	return slices.Clone(outlineSegs)
+}
+
+// bezier returns the point at t of a Bézier curve of control points c.
+func bezier(c [][2]float64, t float64) [2]float64 {
+	p := slices.Clone(c)
+	for n := len(p) - 1; n > 0; n-- {
+		for k := range n {
+			p[k] = [2]float64{p[k][0] + (p[k+1][0]-p[k][0])*t, p[k][1] + (p[k+1][1]-p[k][1])*t}
+		}
+	}
+	return p[0]
 }
 
 // shadeGray returns the sRGB gray of the relative luminance a shade
@@ -898,11 +1313,20 @@ func (e *coreText) register(data []byte, family string) error {
 			}
 		}
 	}
+	e.forgetPrimary()
+	return nil
+}
+
+// forgetPrimary lets go of the fonts of styles, and of their attributes.
+func (e *coreText) forgetPrimary() {
 	for _, f := range e.primary {
 		ct.release(f)
 	}
 	clear(e.primary)
-	return nil
+	for _, a := range e.attrs {
+		ct.release(a)
+	}
+	clear(e.attrs)
 }
 
 func (e *coreText) fontCount() int {
@@ -922,5 +1346,6 @@ func (e *coreText) forgetFonts() {
 		}
 	}
 	clear(e.fonts)
+	clear(e.native)
 	clear(e.color)
 }

@@ -1,12 +1,15 @@
 package text
 
 import (
+	"image"
+	"math"
 	"runtime"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/egoist/mygo/internal/scene"
 	"golang.org/x/image/font/gofont/goregular"
 )
 
@@ -85,7 +88,7 @@ func TestGlyphRaster(t *testing.T) {
 	l := s.Layout(Params{Text: "Ag", Style: Style{Size: 32}})
 	n := 0
 	for _, g := range l.Lines[0].Glyphs {
-		img := s.Glyph(g.Font, g.ID, 1, 0, 0)
+		img := s.Glyph(g.Font, g.ID, 1, 0, 0, false)
 		if !img.OK || img.W == 0 || img.H == 0 || img.Top >= 0 {
 			t.Fatalf("glyph %v: %+v", g.ID, img)
 		}
@@ -136,7 +139,7 @@ func TestGlyphShades(t *testing.T) {
 	}
 	var ink [Shades]int
 	for shade := range Shade(Shades) {
-		img := s.Glyph(g.Font, g.ID, 2, 0, shade)
+		img := s.Glyph(g.Font, g.ID, 2, 0, shade, false)
 		for y := range int(img.H) {
 			for x := range int(img.W) {
 				ink[shade] += int(s.MaskAtlas.Pix[(int(img.Y)+y)*s.MaskAtlas.W+int(img.X)+x])
@@ -147,13 +150,76 @@ func TestGlyphShades(t *testing.T) {
 		t.Skip("font smoothing is off")
 	}
 	for i := 1; i < Shades; i++ {
-		if ink[i] <= ink[i-1] {
+		// Browsers' canvases embolden in fewer steps than Core Text.
+		if ink[i] < ink[i-1] || ink[i] == ink[i-1] && runtime.GOOS != "js" {
 			t.Errorf("ink of the shades %v", ink)
 		}
 	}
 	l = s.Layout(Params{Text: "🎉", Style: Style{Size: 32}})
 	if g := l.Lines[0].Glyphs[0]; g.Font.shaded {
 		t.Errorf("the emoji font is shaded")
+	}
+}
+
+// TestThick rasterizes Thick text as bold as the lightest shade where the
+// engine thickens glyphs (Core Graphics' smoothing has four strengths),
+// whether or not the user smooths fonts, and as other text elsewhere.
+func TestThick(t *testing.T) {
+	s := newSystem()
+	l := s.Layout(Params{Text: "O", Style: Style{Size: 13}})
+	g := l.Lines[0].Glyphs[0]
+	ink := func(f *Font, shade Shade) (n int) {
+		img := s.Glyph(f, g.ID, 2, 0, shade, false)
+		for y := range int(img.H) {
+			for x := range int(img.W) {
+				n += int(s.MaskAtlas.Pix[(int(img.Y)+y)*s.MaskAtlas.W+int(img.X)+x])
+			}
+		}
+		return n
+	}
+	dark, light, thick := ink(g.Font, 0), ink(g.Font, Shades-1), ink(g.Font, Thick)
+	if !g.Font.thickens {
+		if thick != dark {
+			t.Errorf("thick text has ink %d, other text %d", thick, dark)
+		}
+		return
+	}
+	if thick < light || thick <= dark {
+		t.Errorf("thick text has ink %d, the lightest shade %d, the darkest %d", thick, light, dark)
+	}
+	// Without smoothing, as when the user turns it off.
+	unsmoothed := *g.Font
+	unsmoothed.shaded = false
+	if plain, thick := ink(&unsmoothed, Shades-1), ink(&unsmoothed, Thick); thick <= plain {
+		t.Errorf("thick text has ink %d unsmoothed, other text %d", thick, plain)
+	}
+}
+
+// TestFlat rasterizes Flat text unsmoothed, thinner than the darkest shade
+// where the engine smooths fonts, and as other text elsewhere.
+func TestFlat(t *testing.T) {
+	s := newSystem()
+	l := s.Layout(Params{Text: "O", Style: Style{Size: 13}})
+	g := l.Lines[0].Glyphs[0]
+	ink := func(f *Font, shade Shade) (n int) {
+		img := s.Glyph(f, g.ID, 2, 0, shade, false)
+		for y := range int(img.H) {
+			for x := range int(img.W) {
+				n += int(s.MaskAtlas.Pix[(int(img.Y)+y)*s.MaskAtlas.W+int(img.X)+x])
+			}
+		}
+		return n
+	}
+	dark, flat := ink(g.Font, 0), ink(g.Font, Flat)
+	unsmoothed := *g.Font
+	unsmoothed.shaded = false
+	if plain := ink(&unsmoothed, 0); flat != plain {
+		t.Errorf("flat text has ink %d, unsmoothed text %d", flat, plain)
+	}
+	// Browsers' canvases smooth text as they do, and draw Flat text as the
+	// darkest shade.
+	if g.Font.shaded && flat >= dark && runtime.GOOS != "js" {
+		t.Errorf("flat text has ink %d, the darkest shade %d", flat, dark)
 	}
 }
 
@@ -175,6 +241,7 @@ func (s *System) maskPixel(g GlyphImage) byte {
 
 func TestMaskLastsOnceDrawnAgain(t *testing.T) {
 	s := newSystem()
+	width := s.MaskAtlas.W
 	var calls int
 	s.BeginFrame()
 	first := s.Mask(1, square(8, 7, &calls))
@@ -212,13 +279,16 @@ func TestMaskLastsOnceDrawnAgain(t *testing.T) {
 			t.Fatalf("frame %d: %+v", i, g)
 		}
 	}
-	if s.MaskAtlas.W != 1024 {
+	if s.MaskAtlas.W != width {
 		t.Errorf("the atlas grew to %d", s.MaskAtlas.W)
 	}
 }
 
 func TestMakeRoom(t *testing.T) {
 	s := newSystem()
+	// Room for several old masks, so the test exercises eviction and
+	// repacking rather than the small atlas's first growth.
+	s.MaskAtlas = scene.NewAtlas(1, 1024, 1024)
 	var calls int
 	// Fill the lasting rows with masks of earlier frames.
 	var old []uint64
@@ -268,6 +338,30 @@ func TestMakeRoom(t *testing.T) {
 		t.Error("kept a mask the frame did not draw")
 	}
 	s.EndFrame()
+}
+
+// Thin masks can need a much wider or taller atlas without taking much
+// area: one MakeRoom must accommodate them, whatever the starting size.
+func TestMakeRoomForLongMasks(t *testing.T) {
+	for _, size := range []image.Point{{X: 2000, Y: 3}, {X: 3, Y: 2000}} {
+		s := newSystem()
+		s.BeginFrame()
+		draw := func() (int, int, []byte) {
+			pix := make([]byte, size.X*size.Y)
+			for i := range pix {
+				pix[i] = 123
+			}
+			return size.X, size.Y, pix
+		}
+		if s.Mask(1, draw).OK || !s.Full() {
+			t.Fatal("the long mask fit the initial atlas")
+		}
+		s.MakeRoom()
+		if g := s.Mask(1, draw); !g.OK || s.maskPixel(g) != 123 || s.Full() {
+			t.Fatalf("mask %v still does not fit after making room: %+v", size, g)
+		}
+		s.EndFrame()
+	}
 }
 
 func TestRightToLeft(t *testing.T) {
@@ -338,7 +432,7 @@ func TestColorEmoji(t *testing.T) {
 	s := Shared()
 	l := s.Layout(Params{Text: "🎉", Style: Style{Size: 32}})
 	g := l.Lines[0].Glyphs[0]
-	if img := s.Glyph(g.Font, g.ID, 1, 0, 0); !img.OK || !img.Colored || img.W < 16 {
+	if img := s.Glyph(g.Font, g.ID, 1, 0, 0, false); !img.OK || !img.Colored || img.W < 16 {
 		t.Errorf("%+v", img)
 	}
 }
@@ -508,6 +602,11 @@ func TestDigitFeatures(t *testing.T) {
 // the next family that has it, before the system's choice.
 func TestFontListFallback(t *testing.T) {
 	second := map[string]string{"windows": "MS Gothic", "darwin": "Hiragino Mincho ProN", "linux": "Noto Serif CJK JP"}[runtime.GOOS]
+	if second == "" {
+		// Browsers fall back within a list themselves (package text's
+		// canvas engine), and their fonts vary.
+		t.Skip("no font of another family to fall back to on " + runtime.GOOS)
+	}
 	s := newSystem()
 	if err := s.RegisterFont(goregular.TTF, "MyGo Latin"); err != nil {
 		t.Fatal(err)
@@ -548,10 +647,10 @@ func TestFontsOfManySizes(t *testing.T) {
 	for i := range 2 * maxFonts {
 		l := s.Layout(Params{Text: "Hi", Style: Style{Size: 10 + float32(i)/10}})
 		g := l.Lines[0].Glyphs[0]
-		img := s.Glyph(g.Font, g.ID, 1, 0, 0)
+		img := s.Glyph(g.Font, g.ID, 1, 0, 0, false)
 		if !img.OK && s.Full() {
 			s.MakeRoom() // as frames do once the atlas fills
-			img = s.Glyph(g.Font, g.ID, 1, 0, 0)
+			img = s.Glyph(g.Font, g.ID, 1, 0, 0, false)
 		}
 		if !img.OK {
 			t.Fatalf("no glyph at size %v", g.Size)
@@ -559,6 +658,77 @@ func TestFontsOfManySizes(t *testing.T) {
 		s.EndFrame()
 		if n := f.fontCount(); n > maxFonts {
 			t.Fatalf("%d fonts after a frame", n)
+		}
+	}
+}
+
+// TestPlacement checks that glyphs go to the positions within a pixel the
+// system's text stack draws them at, and baselines to its whole pixels:
+// Core Graphics' two positions a pixel at 26 pixels an em, left of the pen,
+// and baselines down to the next pixel; GTK's whole pixels.
+func TestPlacement(t *testing.T) {
+	s := newSystem()
+	l := s.Layout(Params{Text: "l", Style: Style{Size: 13}})
+	g := l.Lines[0].Glyphs[0]
+	at := func(x float32) GlyphImage { return s.Glyph(g.Font, g.ID, 2, x, 0, false) }
+	same := func(a, b GlyphImage) bool { return a.X == b.X && a.Y == b.Y && a.Left == b.Left }
+	switch runtime.GOOS {
+	case "darwin":
+		if !same(at(10), at(10.49)) || same(at(10), at(10.5)) {
+			t.Error("not two positions a pixel")
+		}
+		if b := s.Baseline(20.01); b != 21 {
+			t.Errorf("baseline 20.01 drawn at %v", b)
+		}
+	case "linux":
+		if !same(at(10), at(10.9)) {
+			t.Error("not on whole pixels")
+		}
+		if b := s.Baseline(20.9); b != 20 {
+			t.Errorf("baseline 20.9 drawn at %v", b)
+		}
+	case "windows":
+		if b := s.Baseline(20.6); b != 21 {
+			t.Errorf("baseline 20.6 drawn at %v", b)
+		}
+	}
+}
+
+// TestDecorate checks underlines and strikethroughs: below and above the
+// baseline, at least a fraction of a pixel thick, from the text's start,
+// on whole pixels with a thickness of the app's, and on macOS where AppKit draws them for the system font at 13 points,
+// skipping the ink of descenders.
+func TestDecorate(t *testing.T) {
+	s := newSystem()
+	l := s.Layout(Params{Text: "Hello", Style: Style{Size: 13}})
+	under := s.Decorate(l, 0, 0, len(l.Lines[0].Glyphs), 0, 0, 1, Underline, 0)
+	strike := s.Decorate(l, 0, 0, len(l.Lines[0].Glyphs), 0, 0, 1, Strikethrough, 0)
+	if len(under) != 1 || len(strike) != 1 {
+		t.Fatalf("%d underlines, %d strikethroughs", len(under), len(strike))
+	}
+	base := s.Baseline(l.Lines[0].Baseline)
+	u, st := under[0], strike[0]
+	if u.Top < base || u.Bottom <= u.Top || st.Bottom > base || st.Bottom <= st.Top || u.X0 > 1 || u.X1 < l.Width-1 {
+		t.Errorf("underline %+v, strikethrough %+v, baseline %v, width %v", u, st, base, l.Width)
+	}
+	// Lines of a thickness of the app's cover whole pixels, wherever the
+	// text is.
+	for _, scale := range []float32{1, 1.5} {
+		for _, d := range []Decoration{Underline, Strikethrough} {
+			for _, st := range s.Decorate(l, 0, 0, len(l.Lines[0].Glyphs), 0, 0.3, scale, d, 3) {
+				if st.Bottom-st.Top != float32(math.Round(float64(3*scale))) || st.Top != float32(math.Floor(float64(st.Top))) {
+					t.Errorf("a line 3 DIPs thick at scale %v: %+v", scale, st)
+				}
+			}
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		if u.Top != base+1 || u.Bottom != base+2 || st.Top != base-4 || st.Bottom != base-3 {
+			t.Errorf("underline %+v, strikethrough %+v from baseline %v", u, st, base)
+		}
+		l = s.Layout(Params{Text: "gypsy", Style: Style{Size: 24}})
+		if n := len(s.Decorate(l, 0, 0, len(l.Lines[0].Glyphs), 0, 0, 2, Underline, 0)); n < 3 {
+			t.Errorf("an underline of gypsy in %d pieces", n)
 		}
 	}
 }
