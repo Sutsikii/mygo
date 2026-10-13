@@ -69,7 +69,8 @@ var appMode = sync.OnceValues(func() (setPreferredAppMode, flushMenuThemes uintp
 	return set, flush
 })
 
-// applyMenuTheme gives the popup menus of the app the appearance.
+// applyMenuTheme gives the popup menus of the app, those of its trays
+// included, the appearance.
 func (b *Backend) applyMenuTheme() {
 	set, flush := appMode()
 	if set == 0 {
@@ -111,9 +112,10 @@ type menuBarInfo struct {
 	FocusedBits int32
 }
 
-// darkMenuBar reports whether the window draws its menu bar dark.
+// darkMenuBar reports whether the window draws its menu bar dark. A
+// contrast theme keeps the system's colors, as it does for popup menus.
 func (w *window) darkMenuBar() bool {
-	return w.menuShown() && w.b.isDark()
+	return w.menuShown() && w.b.isDark() && !highContrastOn()
 }
 
 // menuBarRect is the menu bar in window coordinates, which the DCs of
