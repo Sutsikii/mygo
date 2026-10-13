@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"runtime"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -192,10 +193,18 @@ func allowCORS(win *Window, header http.Header, r *http.Request) (preflight bool
 	return true
 }
 
+// schemeHosts is set where the webview serves custom schemes at
+// http://<scheme>.localhost (WebView2). Elsewhere, such an origin is a
+// server on the loopback interface, not the app's.
+var schemeHosts = runtime.GOOS == "windows"
+
 // appOrigin maps the origin WebView2 gives pages of a custom scheme,
 // http://<scheme>.localhost, back to <scheme>://localhost, as the rest of
 // MyGo names it.
 func appOrigin(origin string) string {
+	if !schemeHosts {
+		return origin
+	}
 	u, err := url.Parse(origin)
 	if err != nil || u.Scheme != "http" || u.Port() != "" {
 		return origin

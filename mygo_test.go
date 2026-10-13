@@ -1123,6 +1123,8 @@ func TestProtocolCORS(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer Protocol.Unhandle("assets")
+	defer func(v bool) { schemeHosts = v }(schemeHosts)
+	schemeHosts = true // as on Windows
 	_, fw := testWindow(t, WindowOptions{Page: PageOptions{TrustedOrigins: []string{"https://app.example.com"}}})
 
 	send := func(method, path, origin string, extra http.Header) *recorder {
@@ -1173,6 +1175,14 @@ func TestProtocolCORS(t *testing.T) {
 			t.Errorf("%q got Access-Control-Allow-Origin %q", origin, got)
 		}
 	}
+
+	// Elsewhere, http://<scheme>.localhost is a server on the loopback
+	// interface, not the app.
+	schemeHosts = false
+	if got := send("GET", "/data", "http://mygo.localhost", nil).header.Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("http://mygo.localhost outside Windows got Access-Control-Allow-Origin %q", got)
+	}
+	schemeHosts = true
 
 	// A preflight is answered for the app's pages, not passed to the handler.
 	rec := send("OPTIONS", "/data", "http://mygo.localhost", http.Header{
